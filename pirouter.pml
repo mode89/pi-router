@@ -115,14 +115,14 @@ def handleCompletion piBinary cache parsed =
       prepareSession piBinary parsed (sessionBox.deref ()) in (
       sessionBox.swap (fun _ -> session);
       let endEvent = runTurn session promptText in
-      let [text, stop, usage] = extractAssistantTextAndMeta endEvent in
+      let [text, reasoning, stop, usage] = extractAssistantTextAndMeta endEvent in
       let newMsgs =
         concat parsed.prefixMsgs
           [parsed.lastMsg, {role: "assistant", content: text}]
       in (
         cache.insert (keyFor parsed newMsgs) session;
         sessionBox.swap (fun _ -> nil);  # ownership handed to cache
-        buildCompletion parsed.model text stop usage
+        buildCompletion parsed.model text reasoning stop usage
       )
     )
   finally
@@ -187,7 +187,7 @@ def runTurn session promptText =
 
 
 def extractAssistantTextAndMeta agentEnd =
-  """Pull [text, stopReason, usage] from the last assistant message."""
+  """Pull [text, reasoning, stopReason, usage] from the last assistant message."""
   let assistants =
     get agentEnd "messages" []
     |>> filter (fun m -> (get m "role") == "assistant")
@@ -196,24 +196,35 @@ def extractAssistantTextAndMeta agentEnd =
     when empty? assistants do
       raise $ RuntimeError "pi agent_end contained no assistant message";
     let last = assistants.(len assistants - 1) in
-    let parts =
-      get last "content" []
+    let content = get last "content" [] in
+    let textParts =
+      content
       |>> filter (fun c -> map? c && (get c "type") == "text")
       |>> map (fun c -> get c "text" "")
+      |>> filter string? in
+    let thinkingParts =
+      content
+      |>> filter (fun c -> map? c && (get c "type") == "thinking")
+      |>> map (fun c -> get c "thinking" "")
       |>> filter string?
     in [
-      "" |. join parts,
+      "" |. join textParts,
+      "\n\n" |. join thinkingParts,
       get last "stopReason" "stop",
       get last "usage" {},
     ]
   )
 
 
-def buildCompletion model assistantText stopReason usage =
+def buildCompletion model assistantText reasoningText stopReason usage =
   """Format the OpenAI ChatCompletion response body."""
   let finishReason = if stopReason == "length" then "length" else "stop" in
   let promptTokens = builtins.int $ get usage "input" 0 in
-  let completionTokens = builtins.int $ get usage "output" 0
+  let completionTokens = builtins.int $ get usage "output" 0 in
+  let message =
+    merge
+      {role: "assistant", content: assistantText} $
+      when notEmpty? reasoningText do {reasoning_content: reasoningText}
   in (
     when stopReason == "error" || stopReason == "aborted" do
       log.warning "assistant stopReason=%s" stopReason;
@@ -224,7 +235,7 @@ def buildCompletion model assistantText stopReason usage =
       model: model || "",
       choices: [{
         index: 0,
-        message: {role: "assistant", content: assistantText},
+        message: message,
         finish_reason: finishReason,
       }],
       usage: {
