@@ -3,7 +3,7 @@
 # pirouter — OpenAI-compatible HTTP router backed by `pi --mode rpc`.
 
 import argparse
-import builtins
+import builtins as py
 import collections
 import hashlib
 import http.server
@@ -40,14 +40,14 @@ def IGNORED_WITH_WARNING =
 # CLI entry point: parse args and run the HTTP server.
 def main () =
   let p = argparse.ArgumentParser prog:"pirouter" in (
-    p.add_argument "--port" type:builtins.int default:8742;
+    p.add_argument "--port" type:int default:8742;
     p.add_argument "--host" default:"127.0.0.1";
-    p.add_argument "--sessions" type:builtins.int default:4;
+    p.add_argument "--sessions" type:int default:4;
     p.add_argument "--pi-binary" default:"pi";
     let args = p.parse_args () in
     let cache = SessionCache args.sessions in
     let handlerCls = makeHandler args.pi_binary cache in
-    let addr = builtins.tuple [args.host, args.port] in
+    let addr = py.tuple [args.host, args.port] in
     let server = http.server.ThreadingHTTPServer addr handlerCls in (
       logging.basicConfig
         level:logging.INFO
@@ -74,7 +74,7 @@ def makeHandler piBinary cache =
       then self._error 404 "not found" "invalid_request_error"
       else
         try
-          let length = builtins.int $ self.headers.get "Content-Length" "0" in
+          let length = int $ self.headers.get "Content-Length" "0" in
           let raw = self.rfile.read length in
           let body = loads $ raw.decode "utf-8" in
           let parsed = parseRequest body in
@@ -219,8 +219,8 @@ def extractAssistantTextAndMeta agentEnd =
 def buildCompletion model assistantText reasoningText stopReason usage =
   """Format the OpenAI ChatCompletion response body."""
   let finishReason = if stopReason == "length" then "length" else "stop" in
-  let promptTokens = builtins.int $ get usage "input" 0 in
-  let completionTokens = builtins.int $ get usage "output" 0 in
+  let promptTokens = int $ get usage "input" 0 in
+  let completionTokens = int $ get usage "output" 0 in
   let message =
     merge
       {role: "assistant", content: assistantText} $
@@ -231,7 +231,7 @@ def buildCompletion model assistantText reasoningText stopReason usage =
     {
       id: "chatcmpl-${uuid.uuid4 () |. hex}",
       object: "chat.completion",
-      created: builtins.int $ time.time (),
+      created: int $ time.time (),
       model: model || "",
       choices: [{
         index: 0,
