@@ -167,8 +167,8 @@ def prepareSession piBinary parsed existing =
       when some? parsed.thinking do (
         session.send {type: "set_thinking_level", level: parsed.thinking};
         let resp = session.awaitResponse "set_thinking_level"
-        in when not (get resp "success") do
-          log.warning "set_thinking_level rejected: %s" (get resp "error")
+        in when not resp.success do
+          log.warning "set_thinking_level rejected: %s" resp.error
       );
       [session, composeInitialPrompt parsed.prefixMsgs parsed.lastMsg.content]
     )
@@ -179,8 +179,8 @@ def runTurn session promptText =
   (
     session.send {type: "prompt", message: promptText};
     let resp = session.awaitResponse "prompt" in (
-      when not (get resp "success") do
-        raise $ RuntimeError "pi rejected prompt: ${str (get resp \"error\")}";
+      when not resp.success do
+        raise $ RuntimeError "pi rejected prompt: ${str resp.error}";
       session.awaitAgentEnd ()
     )
   )
@@ -289,26 +289,25 @@ class PiSession = {
   def awaitResponse self command =
     loop _ = nil in
       let msg = self._recv () in
-      if (get msg "type") == "response" && (get msg "command") == command
+      if msg.type == "response" && msg.command == command
       then msg
       else (
-        when (get msg "type") == "extension_ui_request" do
+        when msg.type == "extension_ui_request" do
           log.warning
             "ignoring extension_ui_request method=%s"
-            (get msg "method");
+            msg.method;
         recur nil
       )
 
   def awaitAgentEnd self =
     loop _ = nil in
       let msg = self._recv () in
-      let t = get msg "type" in
-      if t == "agent_end" then msg
+      if msg.type == "agent_end" then msg
       else (
-        when t == "extension_ui_request" do
+        when msg.type == "extension_ui_request" do
           log.warning
             "ignoring extension_ui_request method=%s"
-            (get msg "method");
+            msg.method;
         recur nil
       )
 
@@ -423,7 +422,7 @@ def splitMessages messages =
   let rest =
     messages
     |> filter isConv
-    |> map (fun m -> {role: get m "role", content: textOf m})
+    |> map (fun m -> {role: m.role, content: textOf m})
     |> vec
   in ["\n\n" |. join sysParts, rest]
 
