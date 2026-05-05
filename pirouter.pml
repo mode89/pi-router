@@ -115,14 +115,19 @@ def handleCompletion piBinary cache parsed =
       prepareSession piBinary parsed (sessionBox.deref ()) in (
       sessionBox.swap (fun _ -> session);
       let endEvent = runTurn session promptText in
-      let [text, reasoning, stop, usage] = extractAssistantTextAndMeta endEvent in
+      let [text, reasoning, stop, usage, errorMessage] =
+        extractAssistantTextAndMeta endEvent in
       let newMsgs =
         concat parsed.prefixMsgs
           [parsed.lastMsg, {role: "assistant", content: text}]
       in (
-        cache.insert (keyFor parsed newMsgs) session;
-        sessionBox.swap (fun _ -> nil);  # ownership handed to cache
-        buildCompletion parsed.model text reasoning stop usage
+        # Only cache sessions that ended cleanly. On error/aborted the pi
+        # agent may still be processing, which would reject the next prompt.
+        when stop != "error" && stop != "aborted" do (
+          cache.insert (keyFor parsed newMsgs) session;
+          sessionBox.swap (fun _ -> nil)  # ownership handed to cache
+        );
+        buildCompletion parsed.model text reasoning stop usage errorMessage
       )
     )
   finally
@@ -212,11 +217,12 @@ def extractAssistantTextAndMeta agentEnd =
       "\n\n" |. join thinkingParts,
       get last "stopReason" "stop",
       get last "usage" {},
+      get last "errorMessage" nil,
     ]
   )
 
 
-def buildCompletion model assistantText reasoningText stopReason usage =
+def buildCompletion model assistantText reasoningText stopReason usage errorMessage =
   """Format the OpenAI ChatCompletion response body."""
   let finishReason = if stopReason == "length" then "length" else "stop" in
   let promptTokens = int $ get usage "input" 0 in
@@ -227,7 +233,8 @@ def buildCompletion model assistantText reasoningText stopReason usage =
       when notEmpty? reasoningText do {reasoning_content: reasoningText}
   in (
     when stopReason == "error" || stopReason == "aborted" do
-      log.warning "assistant stopReason=%s" stopReason;
+      log.warning "assistant stopReason=%s: %s"
+        stopReason $ errorMessage || "(no detail)";
     {
       id: "chatcmpl-${uuid.uuid4 () |. hex}",
       object: "chat.completion",
