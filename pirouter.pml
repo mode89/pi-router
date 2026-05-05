@@ -190,7 +190,7 @@ def extractAssistantTextAndMeta agentEnd =
   """Pull [text, reasoning, stopReason, usage] from the last assistant message."""
   let assistants =
     get agentEnd "messages" []
-    |>> filter (fun m -> (get m "role") == "assistant")
+    |> filter (fun m -> (get m "role") == "assistant")
     |> vec
   in (
     when empty? assistants do
@@ -199,14 +199,14 @@ def extractAssistantTextAndMeta agentEnd =
     let content = get last "content" [] in
     let textParts =
       content
-      |>> filter (fun c -> map? c && (get c "type") == "text")
-      |>> map (fun c -> get c "text" "")
-      |>> filter string? in
+      |> filter (fun c -> map? c && (get c "type") == "text")
+      |> map (fun c -> get c "text" "")
+      |> filter string? in
     let thinkingParts =
       content
-      |>> filter (fun c -> map? c && (get c "type") == "thinking")
-      |>> map (fun c -> get c "thinking" "")
-      |>> filter string?
+      |> filter (fun c -> map? c && (get c "type") == "thinking")
+      |> map (fun c -> get c "thinking" "")
+      |> filter string?
     in [
       "" |. join textParts,
       "\n\n" |. join thinkingParts,
@@ -416,14 +416,14 @@ def splitMessages messages =
   let textOf m = extractText $ get m "content" in
   let sysParts =
     messages
-    |>> filter isSys
-    |>> map textOf
-    |>> filter notEmpty?
+    |> filter isSys
+    |> map textOf
+    |> filter notEmpty?
     |> vec in
   let rest =
     messages
-    |>> filter isConv
-    |>> map (fun m -> {role: get m "role", content: textOf m})
+    |> filter isConv
+    |> map (fun m -> {role: get m "role", content: textOf m})
     |> vec
   in ["\n\n" |. join sysParts, rest]
 
@@ -436,9 +436,9 @@ def extractText content =
   | vector? content || list? content ->
     let parts =
       content
-      |>> filter (fun p -> map? p && (get p "type") == "text")
-      |>> map (fun p -> get p "text" "")
-      |>> filter string?
+      |> filter (fun p -> map? p && (get p "type") == "text")
+      |> map (fun p -> get p "text" "")
+      |> filter string?
     in "" |. join parts
   | _ -> ""
 
@@ -452,6 +452,6 @@ def composeInitialPrompt history lastText =
     let lines =
       concat
         ["<conversation>"]
-        (map formatMsg history)
+        (map history formatMsg)
         ["</conversation>"]
     in ("\n".join lines) + "\n\n" + lastText
