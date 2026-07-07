@@ -17,12 +17,12 @@ import threading
 import time
 import uuid
 
-def log = logging.getLogger "pirouter"
+let log = logging.getLogger "pirouter"
 
 
 # ---------- constants ----------
 
-def REASONING_EFFORT_MAP = {
+let REASONING_EFFORT_MAP = {
   none: "off",
   minimal: "minimal",
   low: "low",
@@ -31,14 +31,14 @@ def REASONING_EFFORT_MAP = {
   xhigh: "xhigh",
 }
 
-def IGNORED_WITH_WARNING =
+let IGNORED_WITH_WARNING =
   ["temperature", "stop", "max_tokens", "max_completion_tokens"]
 
 
 # ---------- entry point ----------
 
 # CLI entry point: parse args and run the HTTP server.
-def main () =
+let main () =
   let p = argparse.ArgumentParser prog:"pirouter"
   p.add_argument "--port" type:int default:8742
   p.add_argument "--host" default:"127.0.0.1"
@@ -63,13 +63,13 @@ def main () =
 
 # ---------- HTTP layer ----------
 
-def makeHandler piBinary cache =
+let makeHandler piBinary cache =
   """Build a BaseHTTPRequestHandler subclass closing over piBinary+cache."""
-  let class Handler [http.server.BaseHTTPRequestHandler] =
-    def log_message self fmt *args =
+  class Handler [http.server.BaseHTTPRequestHandler] =
+    let log_message self fmt *args =
       log.info "%s - %s" (self.address_string ()) (fmt mod args)
 
-    def do_POST self =
+    let do_POST self =
       if self.path != "/chat/completions"
       then self._error 404 "not found" "invalid_request_error"
       else
@@ -88,7 +88,7 @@ def makeHandler piBinary cache =
           log.exception "request failed"
           self._error 500 (str e) "server_error"
 
-    def _json self status payload =
+    let _json self status payload =
       let body = dumps payload |. encode "utf-8"
       self.send_response status
       self.send_header "Content-Type" "application/json"
@@ -96,7 +96,7 @@ def makeHandler piBinary cache =
       self.end_headers ()
       self.wfile.write body
 
-    def _error self status message etype =
+    let _error self status message etype =
       self._json status
         {error: {message, type: etype, code: status}}
   Handler
@@ -104,7 +104,7 @@ def makeHandler piBinary cache =
 
 # ---------- request pipeline ----------
 
-def handleCompletion piBinary cache parsed =
+let handleCompletion piBinary cache parsed =
   """Run one chat-completion turn against the session cache."""
   let prefixKey = keyFor parsed parsed.prefixMsgs
   let sessionBox = atom $ cache.pop prefixKey
@@ -129,7 +129,7 @@ def handleCompletion piBinary cache parsed =
     when some? s do s.close ()
 
 
-def parseRequest body =
+let parseRequest body =
   """Validate and normalize the body. Raises ValueError on bad input."""
   let messages = get body "messages"
   when not (vector? messages || list? messages) || empty? messages do
@@ -153,7 +153,7 @@ def parseRequest body =
     lastMsg
 
 
-def prepareSession piBinary parsed existing =
+let prepareSession piBinary parsed existing =
   """Return [session, promptText]. Spawns a new session on cache miss."""
   if some? existing then [existing, parsed.lastMsg.content]
   else
@@ -167,7 +167,7 @@ def prepareSession piBinary parsed existing =
     [session, composeInitialPrompt parsed.prefixMsgs parsed.lastMsg.content]
 
 
-def runTurn session promptText =
+let runTurn session promptText =
   """Send a prompt and return the agent_end event."""
   session.send {type: "prompt", message: promptText}
   let resp = session.awaitResponse "prompt"
@@ -176,7 +176,7 @@ def runTurn session promptText =
   session.awaitAgentEnd ()
 
 
-def extractAssistantTextAndMeta agentEnd =
+let extractAssistantTextAndMeta agentEnd =
   """Pull [text, reasoning, stopReason, usage] from the last assistant message."""
   let assistants =
     get agentEnd "messages" []
@@ -205,7 +205,7 @@ def extractAssistantTextAndMeta agentEnd =
   ]
 
 
-def buildCompletion model assistantText reasoningText stopReason usage errorMessage =
+let buildCompletion model assistantText reasoningText stopReason usage errorMessage =
   """Format the OpenAI ChatCompletion response body."""
   let finishReason = if stopReason == "length" then "length" else "stop"
   let promptTokens = int $ get usage "input" 0
@@ -237,7 +237,7 @@ def buildCompletion model assistantText reasoningText stopReason usage errorMess
 
 # ---------- Pi subprocess ----------
 
-def spawnPi piBinary provider modelId systemPrompt =
+let spawnPi piBinary provider modelId systemPrompt =
   """Spawn a `pi --mode rpc` subprocess locked down for text completion."""
   let baseArgs = [
     piBinary, "--mode", "rpc",
@@ -260,20 +260,20 @@ def spawnPi piBinary provider modelId systemPrompt =
 
 # PiSession wraps one `pi --mode rpc` subprocess.
 class PiSession =
-  def __init__ self proc = set! self.proc proc
+  let __init__ self proc = set! self.proc proc
 
-  def send self cmd =
+  let send self cmd =
     let data = dumps cmd + "\n" |. encode "utf-8"
     self.proc.stdin.write data
     self.proc.stdin.flush ()
 
-  def _recv self =
+  let _recv self =
     let line = self.proc.stdout.readline ()
     if len line == 0
     then raise $ RuntimeError "pi subprocess closed stdout unexpectedly"
     else loads $ line.rstrip () |. decode "utf-8"
 
-  def awaitResponse self command =
+  let awaitResponse self command =
     loop _ = nil in
       let msg = self._recv ()
       if msg.type == "response" && msg.command == command
@@ -285,7 +285,7 @@ class PiSession =
             msg.method
         recur nil
 
-  def awaitAgentEnd self =
+  let awaitAgentEnd self =
     loop _ = nil in
       let msg = self._recv ()
       if msg.type == "agent_end" then msg
@@ -296,7 +296,7 @@ class PiSession =
             msg.method
         recur nil
 
-  def close self =
+  let close self =
     try
       when self.proc.stdin do self.proc.stdin.close ()
     except Exception do nil
@@ -319,15 +319,15 @@ class PiSession =
 
 # SessionCache: LRU cache of `PiSession`s keyed by prefix hash.
 class SessionCache =
-  def __init__ self maxsize =
+  let __init__ self maxsize =
     set! self.maxsize maxsize
     set! self.entries (collections.OrderedDict ())
     set! self.lock (threading.Lock ())
 
-  def pop self key =
+  let pop self key =
     with _ = self.lock do self.entries.pop key nil
 
-  def insert self key session =
+  let insert self key session =
     let toClose =
       with _ = self.lock do
         let evicted =
@@ -341,7 +341,7 @@ class SessionCache =
         else evicted
     for! s in toClose do s.close ()
 
-  def closeAll self =
+  let closeAll self =
     let sessions =
       with _ = self.lock do
         let s = vec $ self.entries.values ()
@@ -352,18 +352,17 @@ class SessionCache =
 
 # ---------- helpers ----------
 
-class Parsed
-  model provider modelId thinking systemPrompt prefixMsgs lastMsg
+class Parsed model provider modelId thinking systemPrompt prefixMsgs lastMsg
 
 
-def keyFor parsed messages =
+let keyFor parsed messages =
   """Hash messages with the parsed request's model/thinking/sys."""
   hashKey
     messages parsed.provider parsed.modelId
     parsed.thinking parsed.systemPrompt
 
 
-def hashKey messages provider modelId thinking systemPrompt =
+let hashKey messages provider modelId thinking systemPrompt =
   """Compute the SHA-256 cache key for messages + model/thinking/sys."""
   let canonical = dumps messages
   let suffix = "|" + (provider || "") + "|" + (modelId || "") + "|"
@@ -372,7 +371,7 @@ def hashKey messages provider modelId thinking systemPrompt =
   h.hexdigest ()
 
 
-def lookupThinking effort =
+let lookupThinking effort =
   """Map an OpenAI reasoning_effort string to Pi's thinking-level token."""
   when some? effort do
     let t = get REASONING_EFFORT_MAP effort
@@ -381,7 +380,7 @@ def lookupThinking effort =
     t
 
 
-def parseModel m =
+let parseModel m =
   """Split an OpenAI `model` string into (provider, modelId)."""
   let nilIfEmpty s = when notEmpty? s do s
   if empty? m then [nil, nil]
@@ -392,7 +391,7 @@ def parseModel m =
     else [nil, m]
 
 
-def splitMessages messages =
+let splitMessages messages =
   """Return [systemPrompt, normalized user/assistant messages]."""
   let isSys m =
     (get m "role") == "system" || (get m "role") == "developer"
@@ -413,22 +412,22 @@ def splitMessages messages =
   ["\n\n" |. join sysParts, rest]
 
 
-def extractText content =
+let extractText content =
   """OpenAI content (string or array of parts) -> plain text."""
   case
-    | nil? content -> ""
-    | string? content -> content
-    | vector? content || list? content ->
+    nil? content -> ""
+    string? content -> content
+    vector? content || list? content ->
       let parts =
         content
           |> filter (fun p -> map? p && (get p "type") == "text")
           |> map (fun p -> get p "text" "")
           |> filter string?
       "" |. join parts
-    | _ -> ""
+    _ -> ""
 
 
-def composeInitialPrompt history lastText =
+let composeInitialPrompt history lastText =
   """Compose the first prompt sent to a fresh Pi session."""
   if empty? history then lastText
   else
