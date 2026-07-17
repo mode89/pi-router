@@ -1,0 +1,22 @@
+{
+  "name": "pi-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "start": "node pirouter.mjs",
+    "test": "node --test pirouter.test.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.80.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "eslint": "^10.7.0"
+  }
+}

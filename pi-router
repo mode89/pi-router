@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+if [ -z "$SCRIPT_DIR" ]; then
+  echo "pi-router: cannot resolve launcher directory" >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "pi-router: Node.js >=22.19.0 is required but node was not found" >&2
+  exit 1
+fi
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)' >/dev/null 2>&1; then
+  echo "pi-router: Node.js >=22.19.0 is required" >&2
+  exit 1
+fi
+if ! command -v npm >/dev/null 2>&1; then
+  echo "pi-router: npm is required but was not found" >&2
+  exit 1
+fi
+
+cd "$SCRIPT_DIR" || {
+  echo "pi-router: cannot enter project directory: $SCRIPT_DIR" >&2
+  exit 1
+}
+
+if ! node --input-type=module --eval "import.meta.resolve('@earendil-works/pi-ai/providers/all')" >/dev/null 2>&1; then
+  echo "pi-router: installing lockfile-declared runtime dependencies" >&2
+  if ! npm ci --omit=dev --ignore-scripts --no-audit --no-fund; then
+    echo "pi-router: dependency installation failed; run 'npm ci --ignore-scripts' in $SCRIPT_DIR" >&2
+    exit 1
+  fi
+fi
+
+exec node "$SCRIPT_DIR/pirouter.mjs" "$@"
