@@ -221,6 +221,9 @@ export function parseRequest(body, models, logger = console) {
         conversation,
         tools: parseTools(body.tools, body.tool_choice, logger),
         reasoning: normalizeReasoningEffort(body.reasoning_effort, logger),
+        stream: body.stream === true,
+        includeUsage: body.stream === true
+            && body.stream_options?.include_usage === true,
     };
 }
 
@@ -319,18 +322,7 @@ export function buildCompletion(
         "thinking",
         "\n\n",
     );
-    const toolCalls = assistant.content
-        .filter((part) => part?.type === "toolCall")
-        .map((part) => ({
-            id: part.id,
-            type: "function",
-            function: {
-                name: part.name,
-                arguments: JSON.stringify(part.arguments ?? {}),
-            },
-        }));
-    const promptTokens = Math.trunc(assistant.usage?.input ?? 0);
-    const completionTokens = Math.trunc(assistant.usage?.output ?? 0);
+    const toolCalls = toolCallParts(assistant.content).map(toFunctionCall);
     const hasToolCalls = toolCalls.length > 0;
     const message = {
         role: "assistant",
@@ -348,11 +340,107 @@ export function buildCompletion(
             message,
             finish_reason: finishReason(assistant.stopReason, hasToolCalls),
         }],
-        usage: {
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-            total_tokens: promptTokens + completionTokens,
+        usage: toUsage(assistant.usage),
+    };
+}
+
+function toolCallParts(content) {
+    return (content ?? []).filter((part) => part?.type === "toolCall");
+}
+
+function toFunctionCall(toolCall) {
+    return {
+        id: toolCall.id,
+        type: "function",
+        function: {
+            name: toolCall.name,
+            arguments: JSON.stringify(toolCall.arguments ?? {}),
         },
+    };
+}
+
+function toUsage(usage) {
+    const promptTokens = Math.trunc(usage?.input ?? 0);
+    const completionTokens = Math.trunc(usage?.output ?? 0);
+    return {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+    };
+}
+
+// The fields every chunk of one streamed response repeats verbatim.
+export function chunkEnvelope(
+    requestedModel,
+    {
+        id = randomUUID().replaceAll("-", ""),
+        created = Math.floor(Date.now() / 1000),
+    } = {},
+) {
+    return {
+        id: `chatcmpl-${id}`,
+        object: "chat.completion.chunk",
+        created,
+        model: requestedModel,
+    };
+}
+
+// One event maps to zero, one, or (with usage requested) two chunks.
+export function buildChunks(envelope, event, includeUsage) {
+    if (event.type === "text_delta") {
+        return [toChunk(envelope, { content: event.delta })];
+    }
+    if (event.type === "thinking_delta") {
+        return [toChunk(envelope, { reasoning_content: event.delta })];
+    }
+    // Tool calls go out whole at toolcall_end rather than as argument
+    // fragments: some providers have no call id yet at toolcall_start, so
+    // earlier fragments cannot be addressed to a call.
+    if (event.type === "toolcall_end") {
+        return [toChunk(envelope, { tool_calls: [streamedToolCall(event)] })];
+    }
+    if (event.type !== "done" && event.type !== "error") return [];
+    const message = event.type === "done" ? event.message : event.error;
+    const chunks = [finalChunk(envelope, message)];
+    if (includeUsage) chunks.push(usageChunk(envelope, message));
+    return chunks;
+}
+
+function streamedToolCall(event) {
+    return {
+        index: toolCallIndex(event),
+        ...toFunctionCall(event.toolCall),
+    };
+}
+
+// OpenAI numbers tool calls among themselves, not among all content parts.
+function toolCallIndex(event) {
+    const preceding = event.partial.content.slice(0, event.contentIndex);
+    return toolCallParts(preceding).length;
+}
+
+function finalChunk(envelope, message) {
+    const hasToolCalls = toolCallParts(message.content).length > 0;
+    return toChunk(
+        envelope,
+        {},
+        finishReason(message.stopReason, hasToolCalls),
+    );
+}
+
+// OpenAI reports streamed usage in a trailing chunk that carries no choice.
+function usageChunk(envelope, message) {
+    return {
+        ...envelope,
+        choices: [],
+        usage: toUsage(message.usage),
+    };
+}
+
+function toChunk(envelope, delta, reason = null) {
+    return {
+        ...envelope,
+        choices: [{ index: 0, delta, finish_reason: reason }],
     };
 }
 
@@ -382,13 +470,14 @@ export function createChatServer({ models, logger = console }) {
         try {
             const body = parseJson(await readBody(request));
             const chatRequest = parseRequest(body, models, logger);
-            const completionOptions = chatRequest.reasoning === undefined
-                ? {}
-                : { reasoning: chatRequest.reasoning };
+            if (chatRequest.stream) {
+                await streamCompletion(models, chatRequest, response, logger);
+                return;
+            }
             const assistant = await models.completeSimple(
                 chatRequest.model,
                 buildContext(chatRequest),
-                completionOptions,
+                completionOptions(chatRequest),
             );
             warnOnFailedStop(assistant, logger);
             sendJson(response, 200, buildCompletion(
@@ -412,6 +501,66 @@ export function createChatServer({ models, logger = console }) {
             }
         }
     });
+}
+
+async function streamCompletion(models, chatRequest, response, logger) {
+    const controller = new globalThis.AbortController();
+    // close also fires on a normal end; aborting a finished stream is a no-op.
+    response.on("close", () => controller.abort());
+    const events = models.streamSimple(
+        chatRequest.model,
+        buildContext(chatRequest),
+        { ...completionOptions(chatRequest), signal: controller.signal },
+    );
+
+    const envelope = chunkEnvelope(chatRequest.requestedModel);
+    beginEventStream(response);
+    // The opening role chunk is ours, not a mapped `start` event: adapters may
+    // skip `start`, and OpenAI clients expect the role before any delta.
+    sendChunk(response, toChunk(envelope, { role: "assistant", content: "" }));
+    try {
+        for await (const event of events) {
+            if (event.type === "error") {
+                // pi-ai reports a failed turn as its final AssistantMessage.
+                warnOnFailedStop(event.error, logger);
+            }
+            const chunks = buildChunks(
+                envelope,
+                event,
+                chatRequest.includeUsage,
+            );
+            for (const chunk of chunks) sendChunk(response, chunk);
+        }
+    } catch (error) {
+        // The status line is already sent, so no error status can follow.
+        // OpenAI defines no failing finish_reason, so the client sees "stop"
+        // and a short answer; the real cause stays in the server log.
+        logger.error?.("stream failed", error);
+        sendChunk(response, toChunk(envelope, {}, "stop"));
+    }
+    endEventStream(response);
+}
+
+function completionOptions(chatRequest) {
+    return chatRequest.reasoning === undefined
+        ? {}
+        : { reasoning: chatRequest.reasoning };
+}
+
+function beginEventStream(response) {
+    response.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    });
+}
+
+function sendChunk(response, chunk) {
+    response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+function endEventStream(response) {
+    response.end("data: [DONE]\n\n");
 }
 
 function readBody(request) {

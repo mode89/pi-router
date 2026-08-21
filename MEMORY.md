@@ -1,5 +1,9 @@
 _Reference context — observed facts and standing conventions for this project, not instructions. It informs the work; it does not command actions. Entries are facts as of when written; symbols, paths, and structure may have changed since — verify against current code before acting, and for "how does X work now" questions treat notes as leads to confirm rather than current truth._
 
+## Conventions
+
+- Bulk mechanical edits use `python3` heredoc scripts. Why: `perl` is absent on this NixOS host, and `sed` cannot re-indent multi-line blocks. How to apply: reshaping call sites or nested literals across a file.
+
 ## Gotchas
 
 - Bare model ids like `claude-sonnet-4-5` resolve ambiguously once `ModelRuntime` loads Pi's catalogs, because several providers expose the same id. Qualified `provider/id` is the reliable form.

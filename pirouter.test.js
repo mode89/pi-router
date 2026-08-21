@@ -15,8 +15,10 @@ import { URL, fileURLToPath } from "node:url";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
     UsageError,
+    buildChunks,
     buildCompletion,
     buildContext,
+    chunkEnvelope,
     createChatServer,
     extractText,
     normalizeReasoningEffort,
@@ -33,19 +35,20 @@ const MODEL = {
     api: "test-api",
 };
 
-function fakeModels(
-    modelList = [MODEL],
+function fakeModels({
+    models = [MODEL],
     complete = async () => assistantResult(),
-) {
+    stream = async function* () { yield doneEvent(); },
+} = {}) {
     return {
         calls: [],
         getModels(provider) {
             return provider === undefined
-                ? modelList
-                : modelList.filter((model) => model.provider === provider);
+                ? models
+                : models.filter((model) => model.provider === provider);
         },
         getModel(provider, id) {
-            return modelList.find((model) => (
+            return models.find((model) => (
                 model.provider === provider && model.id === id
             ));
         },
@@ -53,6 +56,18 @@ function fakeModels(
             this.calls.push({ model, context, options });
             return complete(model, context, options);
         },
+        streamSimple(model, context, options) {
+            this.calls.push({ model, context, options });
+            return stream(model, context, options);
+        },
+    };
+}
+
+function doneEvent(overrides = {}) {
+    return {
+        type: "done",
+        reason: "stop",
+        message: assistantResult(overrides),
     };
 }
 
@@ -113,7 +128,9 @@ test("content and message normalization preserve Paimel behavior", () => {
 
 test("model resolution requires exact and unambiguous matches", () => {
     const duplicate = { ...MODEL, provider: "provider-b" };
-    const models = fakeModels([MODEL, duplicate, { ...MODEL, id: "other" }]);
+    const models = fakeModels({
+        models: [MODEL, duplicate, { ...MODEL, id: "other" }],
+    });
     assert.equal(resolveModel(models, "provider-a/model-a"), MODEL);
     assert.equal(resolveModel(fakeModels(), "model-a"), MODEL);
     assert.throws(() => resolveModel(models, "model-a"), /ambiguous model/);
@@ -425,10 +442,12 @@ test("completion formats reasoning, finish reason, and token usage", () => {
 });
 
 test("assistant stop on error warns but still returns 200", async (t) => {
-    const models = fakeModels([MODEL], async () => assistantResult({
-        stopReason: "error",
-        errorMessage: "provider detail",
-    }));
+    const models = fakeModels({
+        complete: async () => assistantResult({
+            stopReason: "error",
+            errorMessage: "provider detail",
+        }),
+    });
     const warnings = [];
     const logger = { warn: (message) => warnings.push(message), error() {} };
     const { baseUrl } = await startServer(models, t, logger);
@@ -486,12 +505,14 @@ test("model runtime reads credentials from the auth file", async (t) => {
 });
 
 test("HTTP success calls completeSimple, returns OpenAI shape", async (t) => {
-    const models = fakeModels([MODEL], async () => assistantResult({
-        content: [
-            { type: "thinking", thinking: "reason" },
-            { type: "text", text: "result" },
-        ],
-    }));
+    const models = fakeModels({
+        complete: async () => assistantResult({
+            content: [
+                { type: "thinking", thinking: "reason" },
+                { type: "text", text: "result" },
+            ],
+        }),
+    });
     const { server, baseUrl } = await startServer(models, t);
     const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
@@ -524,18 +545,20 @@ test("HTTP success calls completeSimple, returns OpenAI shape", async (t) => {
 });
 
 test("HTTP round-trip forwards tools and returns tool calls", async (t) => {
-    const models = fakeModels([MODEL], async () => assistantResult({
-        content: [
-            { type: "text", text: "calling" },
-            {
-                type: "toolCall",
-                id: "call-1",
-                name: "lookup",
-                arguments: { q: "pi" },
-            },
-        ],
-        stopReason: "toolUse",
-    }));
+    const models = fakeModels({
+        complete: async () => assistantResult({
+            content: [
+                { type: "text", text: "calling" },
+                {
+                    type: "toolCall",
+                    id: "call-1",
+                    name: "lookup",
+                    arguments: { q: "pi" },
+                },
+            ],
+            stopReason: "toolUse",
+        }),
+    });
     const { baseUrl } = await startServer(models, t);
     const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
@@ -554,10 +577,249 @@ test("HTTP round-trip forwards tools and returns tool calls", async (t) => {
     assert.equal(models.calls[0].context.tools.length, 1);
 });
 
+test("parseRequest reads streaming flags", () => {
+    const body = {
+        model: "provider-a/model-a",
+        messages: [{ role: "user", content: "question" }],
+    };
+    const plain = parseRequest(body, fakeModels());
+    assert.equal(plain.stream, false);
+    assert.equal(plain.includeUsage, false);
+    const streamed = parseRequest({
+        ...body,
+        stream: true,
+        stream_options: { include_usage: true },
+    }, fakeModels());
+    assert.equal(streamed.stream, true);
+    assert.equal(streamed.includeUsage, true);
+});
+
+const ENVELOPE = chunkEnvelope("provider-a/model-a", {
+    id: "abc",
+    created: 5,
+});
+
+test("buildChunks ignores events that carry no output", () => {
+    assert.deepEqual(buildChunks(ENVELOPE, { type: "start" }, false), []);
+    assert.deepEqual(
+        buildChunks(ENVELOPE, { type: "toolcall_start" }, false),
+        [],
+    );
+});
+
+test("buildChunks maps text deltas to content deltas", () => {
+    assert.deepEqual(
+        buildChunks(ENVELOPE, { type: "text_delta", delta: "hi" }, false),
+        [{
+            id: "chatcmpl-abc",
+            object: "chat.completion.chunk",
+            created: 5,
+            model: "provider-a/model-a",
+            choices: [{
+                index: 0,
+                delta: { content: "hi" },
+                finish_reason: null,
+            }],
+        }],
+    );
+});
+
+test("buildChunks maps thinking deltas to reasoning deltas", () => {
+    const [chunk] = buildChunks(
+        ENVELOPE,
+        { type: "thinking_delta", delta: "why" },
+        false,
+    );
+    assert.deepEqual(chunk.choices[0].delta, { reasoning_content: "why" });
+});
+
+test("buildChunks numbers tool calls among tool calls only", () => {
+    const [chunk] = buildChunks(ENVELOPE, {
+        type: "toolcall_end",
+        contentIndex: 2,
+        toolCall: { id: "call-1", name: "lookup", arguments: { q: "pi" } },
+        partial: {
+            content: [
+                { type: "text" },
+                { type: "toolCall" },
+                { type: "toolCall" },
+            ],
+        },
+    }, false);
+    assert.deepEqual(chunk.choices[0].delta.tool_calls, [{
+        index: 1,
+        id: "call-1",
+        type: "function",
+        function: { name: "lookup", arguments: "{\"q\":\"pi\"}" },
+    }]);
+});
+
+test("buildChunks ends a done event with a finish reason and usage", () => {
+    const [final, usage] = buildChunks(ENVELOPE, doneEvent(), true);
+    assert.deepEqual(final.choices, [{
+        index: 0,
+        delta: {},
+        finish_reason: "stop",
+    }]);
+    assert.deepEqual(usage.choices, []);
+    assert.deepEqual(usage.usage, {
+        prompt_tokens: 7,
+        completion_tokens: 3,
+        total_tokens: 10,
+    });
+    assert.equal(buildChunks(ENVELOPE, doneEvent(), false).length, 1);
+});
+
+// OpenAI has no failing finish_reason, so a failed turn also reads as "stop".
+test("buildChunks ends an error event like a normal stop", () => {
+    const chunks = buildChunks(ENVELOPE, {
+        type: "error",
+        reason: "error",
+        error: assistantResult({ stopReason: "error" }),
+    }, false);
+    assert.equal(chunks.length, 1);
+    assert.equal(chunks[0].choices[0].finish_reason, "stop");
+});
+
+test("HTTP streaming sends SSE chunks and [DONE]", async (t) => {
+    const models = fakeModels({
+        stream: async function* () {
+            yield { type: "text_delta", delta: "he" };
+            yield { type: "text_delta", delta: "llo" };
+            yield doneEvent({ stopReason: "toolUse", content: [
+                { type: "toolCall", id: "call-1", name: "lookup" },
+            ] });
+        },
+    });
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            stream: true,
+            stream_options: { include_usage: true },
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+
+    const frames = await readEventStream(response);
+    assert.equal(frames.at(-1), "[DONE]");
+    const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
+    assert.deepEqual(chunks[0].choices[0].delta, {
+        role: "assistant",
+        content: "",
+    });
+    assert.deepEqual(
+        chunks.slice(1, 3).map((chunk) => chunk.choices[0].delta.content),
+        ["he", "llo"],
+    );
+    assert.equal(chunks[3].choices[0].finish_reason, "tool_calls");
+    assert.deepEqual(chunks[4].usage, {
+        prompt_tokens: 7,
+        completion_tokens: 3,
+        total_tokens: 10,
+    });
+    assert.equal(chunks.every((chunk) => (
+        chunk.object === "chat.completion.chunk"
+    )), true);
+    const { signal } = models.calls[0].options;
+    assert.equal(signal instanceof globalThis.AbortSignal, true);
+});
+
+test("HTTP streaming omits usage unless requested", async (t) => {
+    const models = fakeModels({
+        stream: async function* () {
+            yield doneEvent();
+        },
+    });
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            stream: true,
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    const frames = await readEventStream(response);
+    const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[1].choices[0].finish_reason, "stop");
+});
+
+test("HTTP streaming ends the stream when the model fails", async (t) => {
+    const errors = [];
+    const models = fakeModels({
+        stream: async function* () {
+            yield { type: "text_delta", delta: "partial" };
+            throw new Error("provider unavailable");
+        },
+    });
+    const { baseUrl } = await startServer(models, t, {
+        warn() {},
+        error(...args) { errors.push(args); },
+    });
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            stream: true,
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    assert.equal(response.status, 200);
+    const frames = await readEventStream(response);
+    assert.equal(frames.at(-1), "[DONE]");
+    const last = JSON.parse(frames.at(-2));
+    assert.equal(last.choices[0].finish_reason, "stop");
+    assert.equal(errors.length, 1);
+});
+
+test("HTTP streaming aborts the model when the client leaves", async (t) => {
+    let released;
+    const blocked = new Promise((resolve) => { released = resolve; });
+    const models = fakeModels({
+        stream: async function* () {
+            yield { type: "text_delta", delta: "partial" };
+            await blocked;
+            yield doneEvent();
+        },
+    });
+    const { baseUrl } = await startServer(models, t);
+    const controller = new globalThis.AbortController();
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            stream: true,
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    const reader = response.body.getReader();
+    await reader.read();
+    controller.abort();
+    const signal = models.calls[0].options.signal;
+    await new Promise((resolve) => {
+        signal.addEventListener("abort", resolve, { once: true });
+    });
+    released();
+    assert.equal(signal.aborted, true);
+});
+
 test("HTTP errors cover bad JSON, path, model, provider failure", async (t) => {
     const duplicate = { ...MODEL, provider: "provider-b" };
-    const models = fakeModels([MODEL, duplicate], async () => {
-        throw new Error("provider unavailable");
+    const models = fakeModels({
+        models: [MODEL, duplicate],
+        complete: async () => {
+            throw new Error("provider unavailable");
+        },
     });
     const { baseUrl } = await startServer(models, t, { error() {} });
 
@@ -642,6 +904,14 @@ test("launcher forwards arguments without invoking npm", async (t) => {
     );
     await assert.rejects(stat(marker), { code: "ENOENT" });
 });
+
+async function readEventStream(response) {
+    const text = await response.text();
+    return text
+        .split("\n\n")
+        .filter((frame) => frame.length > 0)
+        .map((frame) => frame.replace(/^data: /, ""));
+}
 
 async function startServer(models, t, logger = { warn() {}, error() {} }) {
     const server = createChatServer({ models, logger });

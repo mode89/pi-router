@@ -1,6 +1,6 @@
 # pi-router
 
-Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/completions` endpoint backed by `@earendil-works/pi-coding-agent`'s `ModelRuntime`.
+Stateless Node.js router exposing an OpenAI-compatible `POST /chat/completions` endpoint, buffered or streamed as SSE, backed by `@earendil-works/pi-coding-agent`'s `ModelRuntime`.
 
 ## Requirements
 
