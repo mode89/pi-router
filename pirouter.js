@@ -88,9 +88,51 @@ function toAssistantEntry(message) {
         : [{ type: "text", text }];
     return {
         role: "assistant",
-        content: [...textParts, ...toolCalls],
+        // Anthropic rejects a turn whose thinking block does not come first.
+        content: [
+            ...parseReasoningDetails(message.reasoning_details),
+            ...textParts,
+            ...toolCalls,
+        ],
         stopReason: toolCalls.length > 0 ? "toolUse" : "stop",
     };
+}
+
+// A thinking block replays only with the signature its provider issued, so
+// carry OpenRouter's reasoning_details shape both ways; plain reasoning_content
+// is text alone and cannot be replayed.
+export function parseReasoningDetails(details) {
+    if (!Array.isArray(details)) return [];
+    return details
+        .map(toThinkingPart)
+        .filter((part) => part !== null);
+}
+
+function toThinkingPart(detail) {
+    if (detail?.type === "reasoning.encrypted") {
+        // An empty payload reaches the provider as-is: pi-ai demotes unsigned
+        // thinking to text but replays redacted_thinking unchecked.
+        if (typeof detail.data !== "string" || detail.data.length === 0) {
+            return null;
+        }
+        return {
+            type: "thinking",
+            // Placeholder text only: the adapter replays the encrypted payload
+            // from thinkingSignature and discards this.
+            thinking: "[Reasoning redacted]",
+            thinkingSignature: detail.data,
+            redacted: true,
+        };
+    }
+    if (detail?.type !== "reasoning.text"
+        || typeof detail.text !== "string") {
+        return null;
+    }
+    const part = { type: "thinking", thinking: detail.text };
+    if (typeof detail.signature === "string" && detail.signature.length > 0) {
+        part.thinkingSignature = detail.signature;
+    }
+    return part;
 }
 
 function toToolResultEntry(message, toolNames) {
@@ -328,7 +370,11 @@ export function buildCompletion(
         role: "assistant",
         content: hasToolCalls && text.length === 0 ? null : text,
     };
+    const reasoningDetails = toReasoningDetails(assistant.content);
     if (reasoning.length > 0) message.reasoning_content = reasoning;
+    if (reasoningDetails.length > 0) {
+        message.reasoning_details = reasoningDetails;
+    }
     if (hasToolCalls) message.tool_calls = toolCalls;
     return {
         id: `chatcmpl-${id}`,
@@ -342,6 +388,24 @@ export function buildCompletion(
         }],
         usage: toUsage(assistant.usage),
     };
+}
+
+function toReasoningDetails(content) {
+    return content
+        .filter((part) => part?.type === "thinking")
+        .map(toReasoningDetail);
+}
+
+function toReasoningDetail(part) {
+    if (part.redacted === true) {
+        return {
+            type: "reasoning.encrypted",
+            data: part.thinkingSignature ?? "",
+        };
+    }
+    const detail = { type: "reasoning.text", text: part.thinking ?? "" };
+    if (part.thinkingSignature) detail.signature = part.thinkingSignature;
+    return detail;
 }
 
 function toolCallParts(content) {
@@ -392,6 +456,15 @@ export function buildChunks(envelope, event, includeUsage) {
     }
     if (event.type === "thinking_delta") {
         return [toChunk(envelope, { reasoning_content: event.delta })];
+    }
+    // The signature only exists once the block closes, and a redacted block
+    // emits no delta at all, so both travel in the thinking_end chunk.
+    if (event.type === "thinking_end") {
+        const part = event.partial?.content?.[event.contentIndex];
+        if (part?.type !== "thinking") return [];
+        return [toChunk(envelope, {
+            reasoning_details: [toReasoningDetail(part)],
+        })];
     }
     // Tool calls go out whole at toolcall_end rather than as argument
     // fragments: some providers have no call id yet at toolcall_start, so

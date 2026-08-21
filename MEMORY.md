@@ -2,6 +2,7 @@ _Reference context — observed facts and standing conventions for this project,
 
 ## Conventions
 
+- Tests (`npm test`) and lint (`npm run lint`) run without asking the user first. Why: both are read-only and fast. How to apply: after any code change, instead of proposing the command and waiting.
 - Bulk mechanical edits use `python3` heredoc scripts. Why: `perl` is absent on this NixOS host, and `sed` cannot re-indent multi-line blocks. How to apply: reshaping call sites or nested literals across a file.
 
 ## Gotchas
@@ -14,6 +15,9 @@ _Reference context — observed facts and standing conventions for this project,
 - Chat inference is stateless and calls pi-ai directly because every request carries its complete conversation; `AgentSession`, RPC subprocesses, and application session caching add machinery without needed state.
 - The router takes `ModelRuntime` from `@earendil-works/pi-coding-agent` rather than `pi-ai` alone, because its `AuthStorage` holds a `proper-lockfile` lock on `~/.pi/agent/auth.json`, so Pi and the router cannot lose each other's OAuth refreshes.
 - The 11 MB `pi-coding-agent` dependency was accepted over adding a ~40-line lock to a router-local credential store, to avoid mirroring Pi's lock convention by hand and drifting from it.
+- Thinking signatures travel in OpenRouter's `reasoning_details` shape (`reasoning.text` with `signature`, `reasoning.encrypted` with `data`), because OpenAI defines no field for them and that shape is the closest de-facto standard.
+- Inbound `reasoning_content` is ignored while `reasoning_details` is replayed, because text without its signature cannot re-enter a thinking block; pi-ai demotes it to plain text anyway.
+- Reasoning round-trip only helps clients that echo `reasoning_details` back; many drop unknown response fields, and for those the router behaves as before.
 - `createChatServer` takes an injected `Models` collection instead of building a default one, so the factory stays synchronous despite `ModelRuntime.create()` being async, and tests inject fakes.
 
 ## Dead Ends

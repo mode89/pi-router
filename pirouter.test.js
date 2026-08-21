@@ -23,6 +23,7 @@ import {
     extractText,
     normalizeReasoningEffort,
     parseArgs,
+    parseReasoningDetails,
     parseRequest,
     parseTools,
     resolveModel,
@@ -294,6 +295,50 @@ test("tool history becomes tool calls and tool results", () => {
     });
 });
 
+test("replayed reasoning details become leading thinking parts", () => {
+    const { conversation } = splitMessages([
+        {
+            role: "assistant",
+            content: "answer",
+            reasoning_content: "why",
+            reasoning_details: [
+                { type: "reasoning.text", text: "why", signature: "sig" },
+                { type: "reasoning.encrypted", data: "blob" },
+                { type: "reasoning.summary", summary: "ignored" },
+            ],
+        },
+        { role: "user", content: "next" },
+    ]);
+    assert.deepEqual(conversation[0].content, [
+        { type: "thinking", thinking: "why", thinkingSignature: "sig" },
+        {
+            type: "thinking",
+            thinking: "[Reasoning redacted]",
+            thinkingSignature: "blob",
+            redacted: true,
+        },
+        { type: "text", text: "answer" },
+    ]);
+});
+
+test("reasoning details without a signature stay unsigned", () => {
+    assert.deepEqual(
+        parseReasoningDetails([{ type: "reasoning.text", text: "why" }]),
+        [{ type: "thinking", thinking: "why" }],
+    );
+    assert.deepEqual(parseReasoningDetails(undefined), []);
+});
+
+test("redacted details without a payload are dropped", () => {
+    assert.deepEqual(
+        parseReasoningDetails([
+            { type: "reasoning.encrypted" },
+            { type: "reasoning.encrypted", data: "" },
+        ]),
+        [],
+    );
+});
+
 test("malformed tool calls and tool results are rejected", () => {
     const withMessages = (messages) => () => parseRequest(
         { model: "provider-a/model-a", messages },
@@ -424,6 +469,10 @@ test("completion formats reasoning, finish reason, and token usage", () => {
                 role: "assistant",
                 content: "hello world",
                 reasoning_content: "step one\n\nstep two",
+                reasoning_details: [
+                    { type: "reasoning.text", text: "step one" },
+                    { type: "reasoning.text", text: "step two" },
+                ],
             },
             finish_reason: "length",
         }],
@@ -631,6 +680,50 @@ test("buildChunks maps thinking deltas to reasoning deltas", () => {
         false,
     );
     assert.deepEqual(chunk.choices[0].delta, { reasoning_content: "why" });
+});
+
+test("buildChunks sends signatures when a thinking block closes", () => {
+    const [chunk] = buildChunks(ENVELOPE, {
+        type: "thinking_end",
+        contentIndex: 0,
+        partial: {
+            content: [
+                { type: "thinking", thinking: "why", thinkingSignature: "sig" },
+            ],
+        },
+    }, false);
+    assert.deepEqual(chunk.choices[0].delta, {
+        reasoning_details: [
+            { type: "reasoning.text", text: "why", signature: "sig" },
+        ],
+    });
+
+    assert.deepEqual(
+        buildChunks(ENVELOPE, {
+            type: "thinking_end",
+            contentIndex: 3,
+            partial: { content: [] },
+        }, false),
+        [],
+    );
+});
+
+test("buildChunks streams redacted thinking as an encrypted detail", () => {
+    const [chunk] = buildChunks(ENVELOPE, {
+        type: "thinking_end",
+        contentIndex: 0,
+        partial: {
+            content: [{
+                type: "thinking",
+                thinking: "[Reasoning redacted]",
+                thinkingSignature: "blob",
+                redacted: true,
+            }],
+        },
+    }, false);
+    assert.deepEqual(chunk.choices[0].delta, {
+        reasoning_details: [{ type: "reasoning.encrypted", data: "blob" }],
+    });
 });
 
 test("buildChunks numbers tool calls among tool calls only", () => {
