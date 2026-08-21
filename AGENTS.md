@@ -1,6 +1,6 @@
 # pi-router
 
-Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/completions` endpoint backed by built-in `@earendil-works/pi-ai` models.
+Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/completions` endpoint backed by `@earendil-works/pi-coding-agent`'s `ModelRuntime`.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/
 
 ## Key files
 
-- `pirouter.mjs`: HTTP server, request translation, model inference, and credential persistence
+- `pirouter.mjs`: HTTP server, request translation, and model inference
 - `pirouter.test.mjs`: unit, HTTP, credential, and launcher tests
 - `pi-router`: executable launcher that installs missing runtime dependencies
 - `pirouter.pml`: original Paimel implementation retained as a reference
@@ -25,6 +25,6 @@ Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/
 
 ## Runtime configuration
 
-Credentials are read from `$XDG_CONFIG_HOME/pi-router/auth.json`, falling back to `~/.config/pi-router/auth.json`. The file uses pi-ai's provider-keyed credential format.
+`ModelRuntime` reads credentials from `~/.pi/agent/auth.json` and custom models from `~/.pi/agent/models.json`, the same files Pi itself uses.
 
 **Memory — read first.** Read `MEMORY.md` at the start of each session, before your first response — it records facts about this project, its conventions, landmines, dead ends, and decision rationale you can't recover from the code. Skipping it risks repeating solved mistakes.

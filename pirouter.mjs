@@ -2,12 +2,9 @@ import http from "node:http";
 import { Buffer } from "node:buffer";
 import console from "node:console";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 export const IGNORED_WITH_WARNING = [
     "temperature",
@@ -25,64 +22,6 @@ const POSITIVE_REASONING_EFFORTS = new Set([
 ]);
 
 export class RequestError extends Error {}
-
-export class FileCredentialStore {
-    constructor(path = credentialPath()) {
-        this.path = path;
-        this.mutation = Promise.resolve();
-    }
-
-    async read(providerId) {
-        return (await readCredentials(this.path))[providerId];
-    }
-
-    modify(providerId, fn) {
-        const result = this.mutation.catch(() => {}).then(async () => {
-            const credentials = await readCredentials(this.path);
-            const current = credentials[providerId];
-            const replacement = await fn(current);
-            if (replacement === undefined) return current;
-            await writeCredentials(this.path, {
-                ...credentials,
-                [providerId]: replacement,
-            });
-            return replacement;
-        });
-        this.mutation = result;
-        return result;
-    }
-}
-
-async function readCredentials(path) {
-    try {
-        return JSON.parse(await readFile(path, "utf8"));
-    } catch (error) {
-        if (error.code === "ENOENT") return {};
-        throw error;
-    }
-}
-
-async function writeCredentials(path, credentials) {
-    const directory = dirname(path);
-    const temporary = join(directory, `.${randomUUID()}.tmp`);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    try {
-        await writeFile(
-            temporary,
-            `${JSON.stringify(credentials, null, 2)}\n`,
-            { encoding: "utf8", mode: 0o600 },
-        );
-        await rename(temporary, path);
-    } catch (error) {
-        await unlink(temporary).catch(() => {});
-        throw error;
-    }
-}
-
-export function credentialPath(env = process.env, home = homedir()) {
-    const configHome = env.XDG_CONFIG_HOME || join(home, ".config");
-    return join(configHome, "pi-router", "auth.json");
-}
 
 export function extractText(content) {
     if (typeof content === "string") return content;
@@ -271,14 +210,7 @@ export function buildCompletion(
     };
 }
 
-export function createChatServer({
-    models,
-    credentials,
-    logger = console,
-} = {}) {
-    const modelCollection = models ?? builtinModels({
-        credentials: credentials ?? new FileCredentialStore(),
-    });
+export function createChatServer({ models, logger = console }) {
     return http.createServer(async (request, response) => {
         if (request.method !== "POST" || request.url !== "/chat/completions") {
             sendError(response, 404, "not found", "invalid_request_error");
@@ -299,12 +231,12 @@ export function createChatServer({
                 );
                 return;
             }
-            const parsed = parseRequest(body, modelCollection, logger);
+            const parsed = parseRequest(body, models, logger);
             const context = buildContext(parsed);
             const options = parsed.reasoning === undefined
                 ? {}
                 : { reasoning: parsed.reasoning };
-            const assistant = await modelCollection.completeSimple(
+            const assistant = await models.completeSimple(
                 parsed.model,
                 context,
                 options,
@@ -368,7 +300,9 @@ export async function main(args = process.argv.slice(2)) {
         return;
     }
 
-    const server = createChatServer();
+    // Cached catalogs suffice; a catalog fetch must not delay listening.
+    const models = await ModelRuntime.create({ allowModelNetwork: false });
+    const server = createChatServer({ models });
     await new Promise((resolve, reject) => {
         server.once("error", reject);
         server.listen(options.port, options.host, resolve);

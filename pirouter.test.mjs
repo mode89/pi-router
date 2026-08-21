@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import {
     chmod,
     mkdtemp,
-    readFile,
     rm,
     stat,
     writeFile,
@@ -12,15 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import test from "node:test";
-import { setTimeout } from "node:timers";
 import { URL, fileURLToPath } from "node:url";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
-    FileCredentialStore,
     RequestError,
     buildCompletion,
     buildContext,
     createChatServer,
-    credentialPath,
     extractText,
     lookupReasoning,
     parseArgs,
@@ -287,60 +284,32 @@ test(cliParsingTest, () => {
     assert.throws(() => parseArgs(["--port", "nope"]), /invalid port/);
 });
 
-const credentialStoreTest =
-    "credential store serializes and persists OAuth refreshes";
-test(credentialStoreTest, async (t) => {
+const credentialSourceTest =
+    "model runtime reads credentials from the configured auth file";
+test(credentialSourceTest, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "pirouter-auth-"));
-    const path = join(root, "config", "pi-router", "auth.json");
-    const store = new FileCredentialStore(path);
-    assert.equal(await store.read("anthropic"), undefined);
-
-    await store.modify("anthropic", async () => ({
-        type: "api_key",
-        key: "secret",
-        count: 0,
-    }));
-    const increments = Array.from({ length: 8 }, () => (
-        store.modify("anthropic", async (current) => {
-            await new Promise((resolve) => setTimeout(resolve, 2));
-            return { ...current, count: current.count + 1 };
-        })
-    ));
-    await Promise.all(increments);
-    assert.equal((await store.read("anthropic")).count, 8);
-
-    await store.modify("github-copilot", async () => ({
-        type: "oauth",
-        refresh: "old-refresh",
-        access: "old-access",
-        expires: 1,
-    }));
-    await store.modify("github-copilot", async (current) => ({
-        ...current,
-        refresh: "new-refresh",
-        access: "new-access",
-        expires: 999,
-    }));
-    assert.equal((await store.read("github-copilot")).refresh, "new-refresh");
-
-    const stored = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(stored.anthropic.count, 8);
-    assert.equal(stored["github-copilot"].access, "new-access");
-    assert.equal((await stat(path)).mode & 0o777, 0o600);
-    const credentialDirectory = join(root, "config", "pi-router");
-    assert.equal((await stat(credentialDirectory)).mode & 0o777, 0o700);
-
-    const manualCredentials = JSON.stringify({
-        openai: { type: "api_key", key: "manual" },
-    });
-    await writeFile(path, manualCredentials, { mode: 0o600 });
-    assert.equal((await store.read("openai")).key, "manual");
-    await writeFile(path, "not-json", "utf8");
-    await assert.rejects(store.read("openai"), SyntaxError);
-
+    const authPath = join(root, "auth.json");
+    await writeFile(
+        authPath,
+        JSON.stringify({ openai: { type: "api_key", key: "secret" } }),
+        { mode: 0o600 },
+    );
     t.after(async () => {
         await rm(root, { recursive: true, force: true });
     });
+
+    const runtime = await ModelRuntime.create({
+        authPath,
+        modelsPath: null,
+        modelsStorePath: join(root, "models-store.json"),
+        allowModelNetwork: false,
+        refreshOnCreate: false,
+    });
+
+    assert.deepEqual(
+        await runtime.listCredentials(),
+        [{ providerId: "openai", type: "api_key" }],
+    );
 });
 
 const httpSuccessTest =
@@ -476,17 +445,6 @@ test(launcherTest, async (t) => {
         "Usage: pirouter [--host HOST] [--port PORT]\n",
     );
     await assert.rejects(stat(marker), { code: "ENOENT" });
-});
-
-test("credential path honors XDG_CONFIG_HOME and home fallback", () => {
-    assert.equal(
-        credentialPath({ XDG_CONFIG_HOME: "/xdg" }, "/home/test"),
-        "/xdg/pi-router/auth.json",
-    );
-    assert.equal(
-        credentialPath({}, "/home/test"),
-        "/home/test/.config/pi-router/auth.json",
-    );
 });
 
 async function startServer(models, t, logger = { warn() {}, error() {} }) {

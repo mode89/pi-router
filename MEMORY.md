@@ -2,11 +2,17 @@ _Reference context — observed facts and standing conventions for this project,
 
 ## Gotchas
 
-- `FileCredentialStore` serializes mutations only within one process; multiple router processes sharing one auth file can race and lose OAuth refresh updates.
-- `FileCredentialStore` intentionally implements only the `read` and `modify` subset of pi-ai's `CredentialStore`; adding pi-ai login, logout, or status flows may require restoring `list` and `delete`.
+- Bare model ids like `claude-sonnet-4-5` resolve ambiguously once `ModelRuntime` loads Pi's catalogs, because several providers expose the same id. Qualified `provider/id` is the reliable form.
+- `ModelRuntime.create({ refreshOnCreate: false })` leaves `hasConfiguredAuth()` false for a provider present in `auth.json`, because the availability snapshot never runs. `listCredentials()` still reflects the file.
 
 ## Decisions
 
 - Chat inference is stateless and calls pi-ai directly because every request carries its complete conversation; `AgentSession`, RPC subprocesses, and application session caching add machinery without needed state.
-- Router credentials live separately from Pi credentials so OAuth refreshes cannot concurrently rewrite Pi's own auth file; bootstrapping by manually copying compatible credentials is acceptable.
-- Credential persistence keeps process-local refresh serialization, atomic replacement, and secret file permissions, while omitting full-store operations and elaborate validation because the router only performs inference.
+- The router takes `ModelRuntime` from `@earendil-works/pi-coding-agent` rather than `pi-ai` alone, because its `AuthStorage` holds a `proper-lockfile` lock on `~/.pi/agent/auth.json`, so Pi and the router cannot lose each other's OAuth refreshes.
+- The 11 MB `pi-coding-agent` dependency was accepted over adding a ~40-line lock to a router-local credential store, to avoid mirroring Pi's lock convention by hand and drifting from it.
+- `createChatServer` takes an injected `Models` collection instead of building a default one, so the factory stays synchronous despite `ModelRuntime.create()` being async, and tests inject fakes.
+
+## Dead Ends
+
+- ✗ Router-local `FileCredentialStore` writing `$XDG_CONFIG_HOME/pi-router/auth.json`, abandoned: it serialized refreshes only within one process, forcing manual credential copying to avoid racing Pi.
+- ✗ Waiting for `pi-ai` to ship a file-backed credential store, abandoned: as of 0.84.2 it exports only `InMemoryCredentialStore` and expects the app to inject persistence.

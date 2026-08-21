@@ -24,7 +24,7 @@ cd "$SCRIPT_DIR" || {
   exit 1
 }
 
-if ! node --input-type=module --eval "import.meta.resolve('@earendil-works/pi-ai/providers/all')" >/dev/null 2>&1; then
+if ! node --input-type=module --eval "import.meta.resolve('@earendil-works/pi-coding-agent')" >/dev/null 2>&1; then
   echo "pi-router: installing lockfile-declared runtime dependencies" >&2
   if ! npm ci --omit=dev --ignore-scripts --no-audit --no-fund; then
     echo "pi-router: dependency installation failed; run 'npm ci --ignore-scripts' in $SCRIPT_DIR" >&2
