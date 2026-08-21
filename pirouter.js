@@ -6,7 +6,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-export const IGNORED_WITH_WARNING = [
+const IGNORED_REQUEST_FIELDS = [
     "temperature",
     "stop",
     "max_tokens",
@@ -22,6 +22,8 @@ const POSITIVE_REASONING_EFFORTS = new Set([
 ]);
 
 export class RequestError extends Error {}
+
+export class UsageError extends Error {}
 
 export function extractText(content) {
     if (typeof content === "string") return content;
@@ -54,7 +56,7 @@ export function splitMessages(messages) {
     return { systemPrompt, conversation };
 }
 
-export function lookupReasoning(effort, logger = console) {
+export function normalizeReasoningEffort(effort, logger = console) {
     if (effort === undefined || effort === null || effort === "none") {
         return undefined;
     }
@@ -76,10 +78,7 @@ export function resolveModel(models, requestedModel) {
         if (!provider || !modelId) {
             throw new RequestError(`unknown model: ${requestedModel}`);
         }
-        const model = models.getModel?.(provider, modelId)
-            ?? models.getModels(provider).find((candidate) => (
-                candidate.provider === provider && candidate.id === modelId
-            ));
+        const model = models.getModel(provider, modelId);
         if (!model) throw new RequestError(`unknown model: ${requestedModel}`);
         return model;
     }
@@ -103,7 +102,7 @@ export function parseRequest(body, models, logger = console) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
         throw new RequestError("messages must be a non-empty array");
     }
-    for (const field of IGNORED_WITH_WARNING) {
+    for (const field of IGNORED_REQUEST_FIELDS) {
         if (Object.hasOwn(body, field)) {
             logger.warn?.(`ignoring unsupported field: ${field}`);
         }
@@ -123,11 +122,11 @@ export function parseRequest(body, models, logger = console) {
         model,
         systemPrompt,
         conversation,
-        reasoning: lookupReasoning(body.reasoning_effort, logger),
+        reasoning: normalizeReasoningEffort(body.reasoning_effort, logger),
     };
 }
 
-export function buildContext(parsed, timestamp = Date.now()) {
+export function buildContext(chatRequest, timestamp = Date.now()) {
     const zeroUsage = () => ({
         input: 0,
         output: 0,
@@ -136,23 +135,23 @@ export function buildContext(parsed, timestamp = Date.now()) {
         totalTokens: 0,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     });
-    const messages = parsed.conversation.map((message) => {
+    const messages = chatRequest.conversation.map((message) => {
         if (message.role === "user") {
             return { role: "user", content: message.content, timestamp };
         }
         return {
             role: "assistant",
             content: [{ type: "text", text: message.content }],
-            api: parsed.model.api,
-            provider: parsed.model.provider,
-            model: parsed.model.id,
+            api: chatRequest.model.api,
+            provider: chatRequest.model.provider,
+            model: chatRequest.model.id,
             usage: zeroUsage(),
             stopReason: "stop",
             timestamp,
         };
     });
-    return parsed.systemPrompt
-        ? { systemPrompt: parsed.systemPrompt, messages }
+    return chatRequest.systemPrompt
+        ? { systemPrompt: chatRequest.systemPrompt, messages }
         : { messages };
 }
 
@@ -162,30 +161,15 @@ export function buildCompletion(
     {
         id = randomUUID().replaceAll("-", ""),
         created = Math.floor(Date.now() / 1000),
-        logger = console,
     } = {},
 ) {
-    const text = assistant.content
-        .filter((part) => (
-            part?.type === "text" && typeof part.text === "string"
-        ))
-        .map((part) => part.text)
-        .join("");
-    const reasoning = assistant.content
-        .filter((part) => (
-            part?.type === "thinking" && typeof part.thinking === "string"
-        ))
-        .map((part) => part.thinking)
-        .join("\n\n");
-    if (
-        assistant.stopReason === "error"
-        || assistant.stopReason === "aborted"
-    ) {
-        const detail = assistant.errorMessage || "(no detail)";
-        const stopReason = assistant.stopReason;
-        logger.warn?.(`assistant stopReason=${stopReason}: ${detail}`);
-    }
-
+    const text = joinParts(assistant.content, "text", "text");
+    const reasoning = joinParts(
+        assistant.content,
+        "thinking",
+        "thinking",
+        "\n\n",
+    );
     const promptTokens = Math.trunc(assistant.usage?.input ?? 0);
     const completionTokens = Math.trunc(assistant.usage?.output ?? 0);
     const message = { role: "assistant", content: text };
@@ -194,7 +178,7 @@ export function buildCompletion(
         id: `chatcmpl-${id}`,
         object: "chat.completion",
         created,
-        model: requestedModel || "",
+        model: requestedModel,
         choices: [{
             index: 0,
             message,
@@ -210,6 +194,15 @@ export function buildCompletion(
     };
 }
 
+function joinParts(content, type, field, separator = "") {
+    return content
+        .filter((part) => (
+            part?.type === type && typeof part[field] === "string"
+        ))
+        .map((part) => part[field])
+        .join(separator);
+}
+
 export function createChatServer({ models, logger = console }) {
     return http.createServer(async (request, response) => {
         if (request.method !== "POST" || request.url !== "/chat/completions") {
@@ -218,35 +211,21 @@ export function createChatServer({ models, logger = console }) {
         }
 
         try {
-            const raw = await readBody(request);
-            let body;
-            try {
-                body = JSON.parse(raw);
-            } catch (error) {
-                sendError(
-                    response,
-                    400,
-                    `invalid JSON: ${error.message}`,
-                    "invalid_request_error",
-                );
-                return;
-            }
-            const parsed = parseRequest(body, models, logger);
-            const context = buildContext(parsed);
-            const options = parsed.reasoning === undefined
+            const body = parseJson(await readBody(request));
+            const chatRequest = parseRequest(body, models, logger);
+            const completionOptions = chatRequest.reasoning === undefined
                 ? {}
-                : { reasoning: parsed.reasoning };
+                : { reasoning: chatRequest.reasoning };
             const assistant = await models.completeSimple(
-                parsed.model,
-                context,
-                options,
+                chatRequest.model,
+                buildContext(chatRequest),
+                completionOptions,
             );
-            const completion = buildCompletion(
-                parsed.requestedModel,
+            warnOnFailedStop(assistant, logger);
+            sendJson(response, 200, buildCompletion(
+                chatRequest.requestedModel,
                 assistant,
-                { logger },
-            );
-            sendJson(response, 200, completion);
+            ));
         } catch (error) {
             if (error instanceof RequestError) {
                 sendError(
@@ -266,31 +245,89 @@ export function createChatServer({ models, logger = console }) {
     });
 }
 
+function readBody(request) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => chunks.push(chunk));
+        request.on("end", () => resolve(chunks.join("")));
+        request.on("error", reject);
+        request.on("aborted", () => reject(new Error("request aborted")));
+    });
+}
+
+function parseJson(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch (error) {
+        throw new RequestError(`invalid JSON: ${error.message}`);
+    }
+}
+
+function warnOnFailedStop(assistant, logger) {
+    if (
+        assistant.stopReason !== "error"
+        && assistant.stopReason !== "aborted"
+    ) {
+        return;
+    }
+    const detail = assistant.errorMessage || "(no detail)";
+    logger.warn?.(`assistant stopReason=${assistant.stopReason}: ${detail}`);
+}
+
+function sendJson(response, status, payload) {
+    const body = JSON.stringify(payload);
+    response.writeHead(status, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+    });
+    response.end(body);
+}
+
+function sendError(response, status, message, type) {
+    sendJson(response, status, { error: { message, type, code: status } });
+}
+
 export function parseArgs(args) {
-    const options = { host: "127.0.0.1", port: 8742, help: false };
+    let host = "127.0.0.1";
+    let port = "8742";
+    let help = false;
+
     for (let index = 0; index < args.length; index += 1) {
         const argument = args[index];
-        if (argument === "--help" || argument === "-h") {
-            options.help = true;
-        } else if (argument === "--host" || argument === "--port") {
-            if (index + 1 >= args.length) {
-                throw new RequestError(`missing value for ${argument}`);
+        const equals = argument.indexOf("=");
+        const name = equals === -1 ? argument : argument.slice(0, equals);
+        const attached = equals === -1
+            ? undefined
+            : argument.slice(equals + 1);
+        const takeValue = () => {
+            if (attached !== undefined) return attached;
+            index += 1;
+            if (index >= args.length) {
+                throw new UsageError(`missing value for ${name}`);
             }
-            options[argument.slice(2)] = args[++index];
-        } else if (argument.startsWith("--host=")) {
-            options.host = argument.slice(7);
-        } else if (argument.startsWith("--port=")) {
-            options.port = argument.slice(7);
+            return args[index];
+        };
+
+        if (name === "--help" || name === "-h") {
+            help = true;
+        } else if (name === "--host") {
+            host = takeValue();
+        } else if (name === "--port") {
+            port = takeValue();
         } else {
-            throw new RequestError(`unknown argument: ${argument}`);
+            throw new UsageError(`unknown argument: ${argument}`);
         }
     }
-    const port = Number(options.port);
-    if (!Number.isInteger(port) || port < 0 || port > 65535) {
-        throw new RequestError(`invalid port: ${options.port}`);
+
+    const portNumber = Number(port);
+    if (
+        !Number.isInteger(portNumber) || portNumber < 0 || portNumber > 65535
+    ) {
+        throw new UsageError(`invalid port: ${port}`);
     }
-    if (!options.host) throw new RequestError("host must not be empty");
-    return { ...options, port };
+    if (!host) throw new UsageError("host must not be empty");
+    return { host, port: portNumber, help };
 }
 
 export async function main(args = process.argv.slice(2)) {
@@ -307,48 +344,18 @@ export async function main(args = process.argv.slice(2)) {
         server.once("error", reject);
         server.listen(options.port, options.host, resolve);
     });
-    const address = server.address();
-    const port = typeof address === "object" ? address.port : options.port;
+    const { port } = server.address();
     console.info(`pirouter listening on http://${options.host}:${port}`);
 
     await new Promise((resolve) => {
-        let stopping = false;
-        const stop = () => {
-            if (stopping) return;
-            stopping = true;
-            server.close(resolve);
-        };
+        const stop = () => server.close(resolve);
         process.once("SIGINT", stop);
         process.once("SIGTERM", stop);
     });
 }
 
-function readBody(request) {
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        request.setEncoding("utf8");
-        request.on("data", (chunk) => chunks.push(chunk));
-        request.on("end", () => resolve(chunks.join("")));
-        request.on("error", reject);
-        request.on("aborted", () => reject(new Error("request aborted")));
-    });
-}
-
-function sendJson(response, status, payload) {
-    const body = JSON.stringify(payload);
-    response.writeHead(status, {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-    });
-    response.end(body);
-}
-
-function sendError(response, status, message, type) {
-    sendJson(response, status, { error: { message, type, code: status } });
-}
-
 const isDirectExecution = process.argv[1]
-  && import.meta.url === pathToFileURL(process.argv[1]).href;
+    && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isDirectExecution) {
     main().catch((error) => {
         console.error(`pirouter: ${error.message}`);

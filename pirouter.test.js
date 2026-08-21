@@ -14,12 +14,12 @@ import test from "node:test";
 import { URL, fileURLToPath } from "node:url";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
-    RequestError,
+    UsageError,
     buildCompletion,
     buildContext,
     createChatServer,
     extractText,
-    lookupReasoning,
+    normalizeReasoningEffort,
     parseArgs,
     parseRequest,
     resolveModel,
@@ -142,9 +142,9 @@ test("request validation, warnings, and reasoning mapping", () => {
         "ignoring unsupported field: temperature",
         "ignoring unsupported field: max_tokens",
     ]);
-    assert.equal(lookupReasoning("none"), undefined);
-    assert.equal(lookupReasoning("minimal"), "minimal");
-    assert.equal(lookupReasoning("max", logger), undefined);
+    assert.equal(normalizeReasoningEffort("none"), undefined);
+    assert.equal(normalizeReasoningEffort("minimal"), "minimal");
+    assert.equal(normalizeReasoningEffort("max", logger), undefined);
     assert.match(warnings.at(-1), /unknown reasoning_effort/);
 
     const invalid = [
@@ -224,9 +224,7 @@ test("native context synthesizes assistant history metadata", () => {
     });
 });
 
-const completionFormattingTest =
-    "completion formatting includes reasoning, finish reason, and token usage";
-test(completionFormattingTest, () => {
+test("completion formats reasoning, finish reason, and token usage", () => {
     const response = buildCompletion("provider-a/model-a", assistantResult({
         content: [
             { type: "thinking", thinking: "step one" },
@@ -253,22 +251,37 @@ test(completionFormattingTest, () => {
         usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
     });
 
-    const warnings = [];
     const failed = buildCompletion("model-a", assistantResult({
         stopReason: "error",
         errorMessage: "provider detail",
-    }), { logger: { warn: (message) => warnings.push(message) } });
+    }));
     assert.equal(failed.choices[0].finish_reason, "stop");
     assert.deepEqual(failed.choices[0].message, {
         role: "assistant",
         content: "answer",
     });
+});
+
+test("assistant stop on error warns but still returns 200", async (t) => {
+    const models = fakeModels([MODEL], async () => assistantResult({
+        stopReason: "error",
+        errorMessage: "provider detail",
+    }));
+    const warnings = [];
+    const logger = { warn: (message) => warnings.push(message), error() {} };
+    const { baseUrl } = await startServer(models, t, logger);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    assert.equal(response.status, 200);
     assert.match(warnings[0], /provider detail/);
 });
 
-const cliParsingTest =
-    "CLI parsing supports host, port, help, and rejects invalid arguments";
-test(cliParsingTest, () => {
+test("CLI parsing supports host, port, help, rejects bad arguments", () => {
     assert.deepEqual(parseArgs([]), {
         host: "127.0.0.1",
         port: 8742,
@@ -280,13 +293,11 @@ test(cliParsingTest, () => {
         port: 9000,
         help: true,
     });
-    assert.throws(() => parseArgs(["--sessions", "2"]), RequestError);
+    assert.throws(() => parseArgs(["--sessions", "2"]), UsageError);
     assert.throws(() => parseArgs(["--port", "nope"]), /invalid port/);
 });
 
-const credentialSourceTest =
-    "model runtime reads credentials from the configured auth file";
-test(credentialSourceTest, async (t) => {
+test("model runtime reads credentials from the auth file", async (t) => {
     const root = await mkdtemp(join(tmpdir(), "pirouter-auth-"));
     const authPath = join(root, "auth.json");
     await writeFile(
@@ -312,9 +323,7 @@ test(credentialSourceTest, async (t) => {
     );
 });
 
-const httpSuccessTest =
-    "HTTP success calls completeSimple once and returns OpenAI shape";
-test(httpSuccessTest, async (t) => {
+test("HTTP success calls completeSimple, returns OpenAI shape", async (t) => {
     const models = fakeModels([MODEL], async () => assistantResult({
         content: [
             { type: "thinking", thinking: "reason" },
@@ -352,10 +361,7 @@ test(httpSuccessTest, async (t) => {
     assert.equal(server.listening, true);
 });
 
-const httpErrorsTest =
-    "HTTP errors cover malformed JSON, path, model validation, "
-    + "and provider failure";
-test(httpErrorsTest, async (t) => {
+test("HTTP errors cover bad JSON, path, model, provider failure", async (t) => {
     const duplicate = { ...MODEL, provider: "provider-b" };
     const models = fakeModels([MODEL, duplicate], async () => {
         throw new Error("provider unavailable");
@@ -407,10 +413,7 @@ test(httpErrorsTest, async (t) => {
     }
 });
 
-const launcherTest =
-    "launcher forwards arguments without invoking npm when dependencies "
-    + "resolve";
-test(launcherTest, async (t) => {
+test("launcher forwards arguments without invoking npm", async (t) => {
     const root = await mkdtemp(join(tmpdir(), "pirouter-launcher-"));
     const marker = join(root, "npm-called");
     const npm = join(root, "npm");
