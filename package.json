@@ -8,8 +8,8 @@
   },
   "scripts": {
     "lint": "eslint .",
-    "start": "node pirouter.mjs",
-    "test": "node --test pirouter.test.mjs"
+    "start": "node pirouter.js",
+    "test": "node --test pirouter.test.js"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2"

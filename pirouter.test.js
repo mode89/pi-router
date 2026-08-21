@@ -24,7 +24,7 @@ import {
     parseRequest,
     resolveModel,
     splitMessages,
-} from "./pirouter.mjs";
+} from "./pirouter.js";
 
 const MODEL = {
     id: "model-a",

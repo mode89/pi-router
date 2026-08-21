@@ -32,4 +32,4 @@ if ! node --input-type=module --eval "import.meta.resolve('@earendil-works/pi-co
   fi
 fi
 
-exec node "$SCRIPT_DIR/pirouter.mjs" "$@"
+exec node "$SCRIPT_DIR/pirouter.js" "$@"

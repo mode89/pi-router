@@ -9,11 +9,11 @@ Stateless Node.js router exposing a non-streaming OpenAI-compatible `POST /chat/
 
 ## Key files
 
-- `pirouter.mjs`: HTTP server, request translation, and model inference
-- `pirouter.test.mjs`: unit, HTTP, credential, and launcher tests
+- `pirouter.js`: HTTP server, request translation, and model inference
+- `pirouter.test.js`: unit, HTTP, credential, and launcher tests
 - `pi-router`: executable launcher that installs missing runtime dependencies
 - `pirouter.pml`: original Paimel implementation retained as a reference
-- `eslint.config.mjs`: lint configuration
+- `eslint.config.js`: lint configuration
 
 ## Commands
 
