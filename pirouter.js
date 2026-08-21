@@ -45,15 +45,111 @@ export function splitMessages(messages) {
         .map((message) => extractText(message.content))
         .filter((text) => text.length > 0)
         .join("\n\n");
-    const conversation = messages
-        .filter((message) => (
-            message?.role === "user" || message?.role === "assistant"
-        ))
-        .map((message) => ({
-            role: message.role,
-            content: extractText(message.content),
-        }));
+    const toolNames = indexToolCallNames(messages);
+    const conversation = [];
+    for (const message of messages) {
+        if (message?.role === "user") {
+            conversation.push({
+                role: "user",
+                content: extractText(message.content),
+            });
+        } else if (message?.role === "assistant") {
+            conversation.push(toAssistantEntry(message));
+        } else if (message?.role === "tool") {
+            conversation.push(toToolResultEntry(message, toolNames));
+        }
+    }
     return { systemPrompt, conversation };
+}
+
+// A tool message names its tool by id only, so collect the names up front;
+// a result may then precede its call without changing the outcome.
+function indexToolCallNames(messages) {
+    const names = new Map();
+    for (const message of messages) {
+        if (!Array.isArray(message?.tool_calls)) continue;
+        for (const call of message.tool_calls) {
+            if (
+                typeof call?.id === "string"
+                && typeof call.function?.name === "string"
+            ) {
+                names.set(call.id, call.function.name);
+            }
+        }
+    }
+    return names;
+}
+
+function toAssistantEntry(message) {
+    const toolCalls = parseToolCalls(message.tool_calls);
+    const text = extractText(message.content);
+    const textParts = text.length === 0 && toolCalls.length > 0
+        ? []
+        : [{ type: "text", text }];
+    return {
+        role: "assistant",
+        content: [...textParts, ...toolCalls],
+        stopReason: toolCalls.length > 0 ? "toolUse" : "stop",
+    };
+}
+
+function toToolResultEntry(message, toolNames) {
+    const toolCallId = message.tool_call_id;
+    if (typeof toolCallId !== "string" || toolCallId.length === 0) {
+        throw new RequestError("tool messages need tool_call_id");
+    }
+    const hasExplicitName = typeof message.name === "string"
+        && message.name.length > 0;
+    const toolName = hasExplicitName
+        ? message.name
+        : toolNames.get(toolCallId);
+    if (toolName === undefined) {
+        throw new RequestError(`unknown tool_call_id: ${toolCallId}`);
+    }
+    return {
+        role: "toolResult",
+        toolCallId,
+        toolName,
+        content: [{ type: "text", text: extractText(message.content) }],
+        isError: false,
+    };
+}
+
+function parseToolCalls(toolCalls) {
+    if (!Array.isArray(toolCalls)) return [];
+    return toolCalls.map((call) => {
+        const id = call?.id;
+        const name = call?.function?.name;
+        if (typeof id !== "string" || typeof name !== "string") {
+            throw new RequestError(
+                "each tool_calls entry needs id and function.name",
+            );
+        }
+        return {
+            type: "toolCall",
+            id,
+            name,
+            arguments: parseToolArguments(call.function.arguments, name),
+        };
+    });
+}
+
+function parseToolArguments(raw, name) {
+    if (raw === undefined || raw === null || raw === "") return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (error) {
+        throw new RequestError(
+            `invalid arguments for tool ${name}: ${error.message}`,
+        );
+    }
+    if (
+        parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
+    ) {
+        throw new RequestError(`arguments for tool ${name} must be an object`);
+    }
+    return parsed;
 }
 
 export function normalizeReasoningEffort(effort, logger = console) {
@@ -111,10 +207,11 @@ export function parseRequest(body, models, logger = console) {
     const model = resolveModel(models, body.model);
     const { systemPrompt, conversation } = splitMessages(body.messages);
     if (conversation.length === 0) {
-        throw new RequestError("no user/assistant messages");
+        throw new RequestError("no user/assistant/tool messages");
     }
-    if (conversation.at(-1).role !== "user") {
-        throw new RequestError("last message must have role=user");
+    const lastRole = conversation.at(-1).role;
+    if (lastRole !== "user" && lastRole !== "toolResult") {
+        throw new RequestError("last message must have role=user or role=tool");
     }
 
     return {
@@ -122,37 +219,89 @@ export function parseRequest(body, models, logger = console) {
         model,
         systemPrompt,
         conversation,
+        tools: parseTools(body.tools, body.tool_choice, logger),
         reasoning: normalizeReasoningEffort(body.reasoning_effort, logger),
     };
 }
 
+export function parseTools(tools, toolChoice, logger = console) {
+    if (tools === undefined || tools === null) return undefined;
+    if (!Array.isArray(tools)) throw new RequestError("tools must be an array");
+    const parsed = tools.map(toToolDefinition);
+    if (parsed.length === 0) return undefined;
+    // pi-ai's completeSimple copies a fixed option list and drops toolChoice,
+    // so "none" (send no tools) is the only choice the router can honor.
+    if (toolChoice === "none") {
+        logger.warn?.("honoring tool_choice=none: sending no tools");
+        return undefined;
+    }
+    if (toolChoice !== undefined && toolChoice !== null
+        && toolChoice !== "auto") {
+        const formatted = JSON.stringify(toolChoice);
+        logger.warn?.(`ignoring unsupported tool_choice: ${formatted}`);
+    }
+    return parsed;
+}
+
+function toToolDefinition(tool) {
+    if (tool === null || typeof tool !== "object") {
+        throw new RequestError("each tool must be an object");
+    }
+    if (tool.type !== undefined && tool.type !== "function") {
+        throw new RequestError(`unsupported tool type: ${tool.type}`);
+    }
+    const declaration = tool.function;
+    if (
+        declaration === null || typeof declaration !== "object"
+        || typeof declaration.name !== "string" || declaration.name.length === 0
+    ) {
+        throw new RequestError("each tool needs a non-empty function.name");
+    }
+    return {
+        name: declaration.name,
+        description: typeof declaration.description === "string"
+            ? declaration.description
+            : "",
+        parameters: declaration.parameters
+            ?? { type: "object", properties: {} },
+    };
+}
+
 export function buildContext(chatRequest, timestamp = Date.now()) {
-    const zeroUsage = () => ({
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    });
-    const messages = chatRequest.conversation.map((message) => {
-        if (message.role === "user") {
-            return { role: "user", content: message.content, timestamp };
-        }
-        return {
-            role: "assistant",
-            content: [{ type: "text", text: message.content }],
-            api: chatRequest.model.api,
-            provider: chatRequest.model.provider,
-            model: chatRequest.model.id,
-            usage: zeroUsage(),
-            stopReason: "stop",
-            timestamp,
-        };
-    });
-    return chatRequest.systemPrompt
-        ? { systemPrompt: chatRequest.systemPrompt, messages }
-        : { messages };
+    const { systemPrompt, tools, model } = chatRequest;
+    const messages = chatRequest.conversation.map((message) => (
+        message.role === "assistant"
+            ? { ...message, ...replayedAssistantFields(model), timestamp }
+            : { ...message, timestamp }
+    ));
+    const context = { messages };
+    if (systemPrompt) context.systemPrompt = systemPrompt;
+    if (tools) context.tools = tools;
+    return context;
+}
+
+// Replayed assistant turns carry no provenance or usage, but pi-ai's
+// AssistantMessage requires both, so stand in for the original generation.
+function replayedAssistantFields(model) {
+    return {
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+            },
+        },
+    };
 }
 
 export function buildCompletion(
@@ -170,10 +319,25 @@ export function buildCompletion(
         "thinking",
         "\n\n",
     );
+    const toolCalls = assistant.content
+        .filter((part) => part?.type === "toolCall")
+        .map((part) => ({
+            id: part.id,
+            type: "function",
+            function: {
+                name: part.name,
+                arguments: JSON.stringify(part.arguments ?? {}),
+            },
+        }));
     const promptTokens = Math.trunc(assistant.usage?.input ?? 0);
     const completionTokens = Math.trunc(assistant.usage?.output ?? 0);
-    const message = { role: "assistant", content: text };
+    const hasToolCalls = toolCalls.length > 0;
+    const message = {
+        role: "assistant",
+        content: hasToolCalls && text.length === 0 ? null : text,
+    };
     if (reasoning.length > 0) message.reasoning_content = reasoning;
+    if (hasToolCalls) message.tool_calls = toolCalls;
     return {
         id: `chatcmpl-${id}`,
         object: "chat.completion",
@@ -182,9 +346,7 @@ export function buildCompletion(
         choices: [{
             index: 0,
             message,
-            finish_reason: assistant.stopReason === "length"
-                ? "length"
-                : "stop",
+            finish_reason: finishReason(assistant.stopReason, hasToolCalls),
         }],
         usage: {
             prompt_tokens: promptTokens,
@@ -192,6 +354,13 @@ export function buildCompletion(
             total_tokens: promptTokens + completionTokens,
         },
     };
+}
+
+function finishReason(stopReason, hasToolCalls) {
+    // hasToolCalls also decides it, for providers that emit tool calls
+    // without setting stopReason=toolUse.
+    if (stopReason === "toolUse" || hasToolCalls) return "tool_calls";
+    return stopReason === "length" ? "length" : "stop";
 }
 
 function joinParts(content, type, field, separator = "") {

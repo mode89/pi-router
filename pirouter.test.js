@@ -22,6 +22,7 @@ import {
     normalizeReasoningEffort,
     parseArgs,
     parseRequest,
+    parseTools,
     resolveModel,
     splitMessages,
 } from "./pirouter.js";
@@ -95,13 +96,16 @@ test("content and message normalization preserve Paimel behavior", () => {
     assert.deepEqual(splitMessages([
         { role: "system", content: "system" },
         { role: "developer", content: [{ type: "text", text: "developer" }] },
-        { role: "tool", content: "ignored" },
         { role: "assistant", content: "old answer" },
         { role: "user", content: [{ type: "text", text: "new question" }] },
     ]), {
         systemPrompt: "system\n\ndeveloper",
         conversation: [
-            { role: "assistant", content: "old answer" },
+            {
+                role: "assistant",
+                content: [{ type: "text", text: "old answer" }],
+                stopReason: "stop",
+            },
             { role: "user", content: "new question" },
         ],
     });
@@ -158,7 +162,7 @@ test("request validation, warnings, and reasoning mapping", () => {
                 messages: [{ role: "system", content: "x" }],
                 model: "model-a",
             },
-            /no user\/assistant messages/,
+            /no user\/assistant\/tool messages/,
         ],
         [
             {
@@ -166,6 +170,15 @@ test("request validation, warnings, and reasoning mapping", () => {
                 model: "model-a",
             },
             /last message must have role=user/,
+        ],
+        [
+            {
+                messages: [
+                    { role: "tool", content: "x", tool_call_id: "gone" },
+                ],
+                model: "model-a",
+            },
+            /unknown tool_call_id: gone/,
         ],
         [
             { messages: [{ role: "user", content: "x" }] },
@@ -221,6 +234,155 @@ test("native context synthesizes assistant history metadata", () => {
         role: "user",
         content: "next",
         timestamp: 1234,
+    });
+});
+
+test("tool history becomes tool calls and tool results", () => {
+    const parsed = parseRequest({
+        model: "provider-a/model-a",
+        messages: [
+            { role: "user", content: "question" },
+            {
+                role: "assistant",
+                content: null,
+                tool_calls: [{
+                    id: "call-1",
+                    type: "function",
+                    function: {
+                        name: "lookup",
+                        arguments: "{\"q\":\"pi\"}",
+                    },
+                }],
+            },
+            { role: "tool", tool_call_id: "call-1", content: "found" },
+        ],
+    }, fakeModels());
+
+    const context = buildContext(parsed, 1234);
+    assert.equal(context.tools, undefined);
+    assert.deepEqual(context.messages[1].content, [{
+        type: "toolCall",
+        id: "call-1",
+        name: "lookup",
+        arguments: { q: "pi" },
+    }]);
+    assert.equal(context.messages[1].stopReason, "toolUse");
+    assert.deepEqual(context.messages[2], {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "lookup",
+        content: [{ type: "text", text: "found" }],
+        isError: false,
+        timestamp: 1234,
+    });
+});
+
+test("malformed tool calls and tool results are rejected", () => {
+    const withMessages = (messages) => () => parseRequest(
+        { model: "provider-a/model-a", messages },
+        fakeModels(),
+        { warn() {} },
+    );
+    const calling = (toolCall) => [
+        { role: "user", content: "q" },
+        { role: "assistant", tool_calls: [toolCall] },
+        { role: "tool", tool_call_id: "call-1", content: "x" },
+    ];
+    assert.throws(
+        withMessages(calling({
+            id: "call-1",
+            function: { name: "lookup", arguments: "{oops" },
+        })),
+        /invalid arguments for tool lookup/,
+    );
+    assert.throws(
+        withMessages(calling({
+            id: "call-1",
+            function: { name: "lookup", arguments: "[1]" },
+        })),
+        /arguments for tool lookup must be an object/,
+    );
+    assert.throws(
+        withMessages(calling({ function: { name: "lookup" } })),
+        /needs id and function.name/,
+    );
+    assert.throws(
+        withMessages([
+            { role: "user", content: "q" },
+            { role: "tool", content: "x" },
+        ]),
+        /tool messages need tool_call_id/,
+    );
+});
+
+test("tool declaration and tool_choice validation", () => {
+    const warnings = [];
+    const logger = { warn: (message) => warnings.push(message) };
+    assert.deepEqual(parseTools([{
+        type: "function",
+        function: {
+            name: "lookup",
+            description: "look it up",
+            parameters: { type: "object", properties: { q: {} } },
+        },
+    }, { function: { name: "bare" } }], undefined, logger), [
+        {
+            name: "lookup",
+            description: "look it up",
+            parameters: { type: "object", properties: { q: {} } },
+        },
+        {
+            name: "bare",
+            description: "",
+            parameters: { type: "object", properties: {} },
+        },
+    ]);
+
+    const tools = [{ type: "function", function: { name: "lookup" } }];
+    assert.equal(parseTools(undefined, undefined, logger), undefined);
+    assert.equal(parseTools([], undefined, logger), undefined);
+    assert.equal(parseTools(tools, "none", logger), undefined);
+    assert.equal(
+        warnings.at(-1),
+        "honoring tool_choice=none: sending no tools",
+    );
+    assert.equal(parseTools(tools, "auto", logger).length, 1);
+    assert.equal(parseTools(tools, { type: "function" }, logger).length, 1);
+    assert.match(warnings.at(-1), /ignoring unsupported tool_choice/);
+
+    assert.throws(() => parseTools({}, undefined, logger), /must be an array/);
+    assert.throws(
+        () => parseTools([{ type: "custom", function: { name: "x" } }]),
+        /unsupported tool type: custom/,
+    );
+    assert.throws(
+        () => parseTools([{ type: "function", function: {} }]),
+        /needs a non-empty function.name/,
+    );
+});
+
+test("completion reports tool calls with stringified arguments", () => {
+    const response = buildCompletion("model-a", assistantResult({
+        content: [{
+            type: "toolCall",
+            id: "call-1",
+            name: "lookup",
+            arguments: { q: "pi" },
+        }],
+        stopReason: "toolUse",
+    }));
+    assert.deepEqual(response.choices[0], {
+        index: 0,
+        message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+                id: "call-1",
+                type: "function",
+                function: { name: "lookup", arguments: "{\"q\":\"pi\"}" },
+            }],
+        },
+        finish_reason: "tool_calls",
     });
 });
 
@@ -359,6 +521,37 @@ test("HTTP success calls completeSimple, returns OpenAI shape", async (t) => {
     assert.deepEqual(models.calls[0].options, { reasoning: "medium" });
     assert.equal(models.calls[0].context.systemPrompt, "rules");
     assert.equal(server.listening, true);
+});
+
+test("HTTP round-trip forwards tools and returns tool calls", async (t) => {
+    const models = fakeModels([MODEL], async () => assistantResult({
+        content: [
+            { type: "text", text: "calling" },
+            {
+                type: "toolCall",
+                id: "call-1",
+                name: "lookup",
+                arguments: { q: "pi" },
+            },
+        ],
+        stopReason: "toolUse",
+    }));
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            tools: [{ type: "function", function: { name: "lookup" } }],
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.choices[0].finish_reason, "tool_calls");
+    assert.equal(body.choices[0].message.content, "calling");
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, "lookup");
+    assert.equal(models.calls[0].context.tools.length, 1);
 });
 
 test("HTTP errors cover bad JSON, path, model, provider failure", async (t) => {
