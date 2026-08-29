@@ -264,8 +264,6 @@ export function parseRequest(body, models, logger = console) {
         tools: parseTools(body.tools, body.tool_choice, logger),
         reasoning: normalizeReasoningEffort(body.reasoning_effort, logger),
         stream: body.stream === true,
-        includeUsage: body.stream === true
-            && body.stream_options?.include_usage === true,
     };
 }
 
@@ -424,13 +422,31 @@ function toFunctionCall(toolCall) {
 }
 
 function toUsage(usage) {
-    const promptTokens = Math.trunc(usage?.input ?? 0);
-    const completionTokens = Math.trunc(usage?.output ?? 0);
-    return {
+    const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+    const promptCost = usage.cost.input
+        + usage.cost.cacheRead
+        + usage.cost.cacheWrite;
+    const openRouterUsage = {
         prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
+        completion_tokens: usage.output,
+        total_tokens: usage.totalTokens,
+        prompt_tokens_details: {
+            cached_tokens: usage.cacheRead,
+            cache_write_tokens: usage.cacheWrite,
+        },
+        cost: usage.cost.total,
+        cost_details: {
+            upstream_inference_prompt_cost: promptCost,
+            upstream_inference_completions_cost: usage.cost.output,
+            upstream_inference_cost: usage.cost.total,
+        },
     };
+    if (usage.reasoning !== undefined) {
+        openRouterUsage.completion_tokens_details = {
+            reasoning_tokens: usage.reasoning,
+        };
+    }
+    return openRouterUsage;
 }
 
 // The fields every chunk of one streamed response repeats verbatim.
@@ -449,8 +465,8 @@ export function chunkEnvelope(
     };
 }
 
-// One event maps to zero, one, or (with usage requested) two chunks.
-export function buildChunks(envelope, event, includeUsage) {
+// One event maps to zero, one, or two chunks.
+export function buildChunks(envelope, event) {
     if (event.type === "text_delta") {
         return [toChunk(envelope, { content: event.delta })];
     }
@@ -475,7 +491,9 @@ export function buildChunks(envelope, event, includeUsage) {
     if (event.type !== "done" && event.type !== "error") return [];
     const message = event.type === "done" ? event.message : event.error;
     const chunks = [finalChunk(envelope, message)];
-    if (includeUsage) chunks.push(usageChunk(envelope, message));
+    if (message.usage !== undefined) {
+        chunks.push(usageChunk(envelope, message));
+    }
     return chunks;
 }
 
@@ -597,11 +615,7 @@ async function streamCompletion(models, chatRequest, response, logger) {
                 // pi-ai reports a failed turn as its final AssistantMessage.
                 warnOnFailedStop(event.error, logger);
             }
-            const chunks = buildChunks(
-                envelope,
-                event,
-                chatRequest.includeUsage,
-            );
+            const chunks = buildChunks(envelope, event);
             for (const chunk of chunks) sendChunk(response, chunk);
         }
     } catch (error) {

@@ -79,25 +79,50 @@ function assistantResult(overrides = {}) {
         api: MODEL.api,
         provider: MODEL.provider,
         model: MODEL.id,
-        usage: {
-            input: 7,
-            output: 3,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 10,
-            cost: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                total: 0,
-            },
-        },
+        usage: piUsage(),
         stopReason: "stop",
         timestamp: 1,
         ...overrides,
     };
 }
+
+function piUsage({ cost: costOverrides = {}, ...usageOverrides } = {}) {
+    return {
+        input: 7,
+        output: 5,
+        cacheRead: 11,
+        cacheWrite: 13,
+        cacheWrite1h: 4,
+        reasoning: 2,
+        totalTokens: 99,
+        ...usageOverrides,
+        cost: {
+            input: 1.25,
+            output: 3.25,
+            cacheRead: 0.5,
+            cacheWrite: 0.75,
+            total: 9.5,
+            ...costOverrides,
+        },
+    };
+}
+
+const EXPECTED_USAGE = {
+    prompt_tokens: 31,
+    completion_tokens: 5,
+    total_tokens: 99,
+    prompt_tokens_details: {
+        cached_tokens: 11,
+        cache_write_tokens: 13,
+    },
+    cost: 9.5,
+    cost_details: {
+        upstream_inference_prompt_cost: 2.5,
+        upstream_inference_completions_cost: 3.25,
+        upstream_inference_cost: 9.5,
+    },
+    completion_tokens_details: { reasoning_tokens: 2 },
+};
 
 test("content and message normalization preserve Paimel behavior", () => {
     assert.equal(extractText("plain"), "plain");
@@ -476,7 +501,7 @@ test("completion formats reasoning, finish reason, and token usage", () => {
             },
             finish_reason: "length",
         }],
-        usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
+        usage: EXPECTED_USAGE,
     });
 
     const failed = buildCompletion("model-a", assistantResult({
@@ -580,17 +605,105 @@ test("HTTP success calls completeSimple, returns OpenAI shape", async (t) => {
     assert.equal(body.model, "provider-a/model-a");
     assert.equal(body.choices[0].message.content, "result");
     assert.equal(body.choices[0].message.reasoning_content, "reason");
-    assert.deepEqual(body.usage, {
-        prompt_tokens: 7,
-        completion_tokens: 3,
-        total_tokens: 10,
-    });
+    assert.deepEqual(body.usage, EXPECTED_USAGE);
     assert.match(body.id, /^chatcmpl-[0-9a-f]{32}$/);
     assert.equal(models.calls.length, 1);
     assert.equal(models.calls[0].model, MODEL);
     assert.deepEqual(models.calls[0].options, { reasoning: "medium" });
     assert.equal(models.calls[0].context.systemPrompt, "rules");
     assert.equal(server.listening, true);
+});
+
+test("HTTP usage omits unknown reasoning", async (t) => {
+    const usage = piUsage();
+    delete usage.reasoning;
+    const models = fakeModels({
+        complete: async () => assistantResult({ usage }),
+    });
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+
+    assert.equal(
+        Object.hasOwn(
+            (await response.json()).usage,
+            "completion_tokens_details",
+        ),
+        false,
+    );
+});
+
+test("HTTP usage keeps explicit zero reasoning", async (t) => {
+    const models = fakeModels({
+        complete: async () => assistantResult({
+            usage: piUsage({ reasoning: 0 }),
+        }),
+    });
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+
+    assert.deepEqual(
+        (await response.json()).usage.completion_tokens_details,
+        { reasoning_tokens: 0 },
+    );
+});
+
+test("HTTP buffered responses retain all-zero usage", async (t) => {
+    const usage = piUsage({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: undefined,
+        totalTokens: 0,
+        cost: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 0,
+        },
+    });
+    const models = fakeModels({
+        complete: async () => assistantResult({ usage }),
+    });
+    const { baseUrl } = await startServer(models, t);
+    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        body: JSON.stringify({
+            model: "provider-a/model-a",
+            messages: [{ role: "user", content: "question" }],
+        }),
+    });
+
+    assert.deepEqual((await response.json()).usage, {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        prompt_tokens_details: {
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        cost: 0,
+        cost_details: {
+            upstream_inference_prompt_cost: 0,
+            upstream_inference_completions_cost: 0,
+            upstream_inference_cost: 0,
+        },
+    });
 });
 
 test("HTTP round-trip forwards tools and returns tool calls", async (t) => {
@@ -623,6 +736,7 @@ test("HTTP round-trip forwards tools and returns tool calls", async (t) => {
     assert.equal(body.choices[0].finish_reason, "tool_calls");
     assert.equal(body.choices[0].message.content, "calling");
     assert.equal(body.choices[0].message.tool_calls[0].function.name, "lookup");
+    assert.deepEqual(body.usage, EXPECTED_USAGE);
     assert.equal(models.calls[0].context.tools.length, 1);
 });
 
@@ -633,14 +747,12 @@ test("parseRequest reads streaming flags", () => {
     };
     const plain = parseRequest(body, fakeModels());
     assert.equal(plain.stream, false);
-    assert.equal(plain.includeUsage, false);
     const streamed = parseRequest({
         ...body,
         stream: true,
         stream_options: { include_usage: true },
     }, fakeModels());
     assert.equal(streamed.stream, true);
-    assert.equal(streamed.includeUsage, true);
 });
 
 const ENVELOPE = chunkEnvelope("provider-a/model-a", {
@@ -649,16 +761,16 @@ const ENVELOPE = chunkEnvelope("provider-a/model-a", {
 });
 
 test("buildChunks ignores events that carry no output", () => {
-    assert.deepEqual(buildChunks(ENVELOPE, { type: "start" }, false), []);
+    assert.deepEqual(buildChunks(ENVELOPE, { type: "start" }), []);
     assert.deepEqual(
-        buildChunks(ENVELOPE, { type: "toolcall_start" }, false),
+        buildChunks(ENVELOPE, { type: "toolcall_start" }),
         [],
     );
 });
 
 test("buildChunks maps text deltas to content deltas", () => {
     assert.deepEqual(
-        buildChunks(ENVELOPE, { type: "text_delta", delta: "hi" }, false),
+        buildChunks(ENVELOPE, { type: "text_delta", delta: "hi" }),
         [{
             id: "chatcmpl-abc",
             object: "chat.completion.chunk",
@@ -677,7 +789,6 @@ test("buildChunks maps thinking deltas to reasoning deltas", () => {
     const [chunk] = buildChunks(
         ENVELOPE,
         { type: "thinking_delta", delta: "why" },
-        false,
     );
     assert.deepEqual(chunk.choices[0].delta, { reasoning_content: "why" });
 });
@@ -691,7 +802,7 @@ test("buildChunks sends signatures when a thinking block closes", () => {
                 { type: "thinking", thinking: "why", thinkingSignature: "sig" },
             ],
         },
-    }, false);
+    });
     assert.deepEqual(chunk.choices[0].delta, {
         reasoning_details: [
             { type: "reasoning.text", text: "why", signature: "sig" },
@@ -703,7 +814,7 @@ test("buildChunks sends signatures when a thinking block closes", () => {
             type: "thinking_end",
             contentIndex: 3,
             partial: { content: [] },
-        }, false),
+        }),
         [],
     );
 });
@@ -720,7 +831,7 @@ test("buildChunks streams redacted thinking as an encrypted detail", () => {
                 redacted: true,
             }],
         },
-    }, false);
+    });
     assert.deepEqual(chunk.choices[0].delta, {
         reasoning_details: [{ type: "reasoning.encrypted", data: "blob" }],
     });
@@ -738,7 +849,7 @@ test("buildChunks numbers tool calls among tool calls only", () => {
                 { type: "toolCall" },
             ],
         },
-    }, false);
+    });
     assert.deepEqual(chunk.choices[0].delta.tool_calls, [{
         index: 1,
         id: "call-1",
@@ -748,19 +859,14 @@ test("buildChunks numbers tool calls among tool calls only", () => {
 });
 
 test("buildChunks ends a done event with a finish reason and usage", () => {
-    const [final, usage] = buildChunks(ENVELOPE, doneEvent(), true);
+    const [final, usage] = buildChunks(ENVELOPE, doneEvent());
     assert.deepEqual(final.choices, [{
         index: 0,
         delta: {},
         finish_reason: "stop",
     }]);
     assert.deepEqual(usage.choices, []);
-    assert.deepEqual(usage.usage, {
-        prompt_tokens: 7,
-        completion_tokens: 3,
-        total_tokens: 10,
-    });
-    assert.equal(buildChunks(ENVELOPE, doneEvent(), false).length, 1);
+    assert.deepEqual(usage.usage, EXPECTED_USAGE);
 });
 
 // OpenAI has no failing finish_reason, so a failed turn also reads as "stop".
@@ -769,9 +875,10 @@ test("buildChunks ends an error event like a normal stop", () => {
         type: "error",
         reason: "error",
         error: assistantResult({ stopReason: "error" }),
-    }, false);
-    assert.equal(chunks.length, 1);
+    });
+    assert.equal(chunks.length, 2);
     assert.equal(chunks[0].choices[0].finish_reason, "stop");
+    assert.deepEqual(chunks[1].usage, EXPECTED_USAGE);
 });
 
 test("HTTP streaming sends SSE chunks and [DONE]", async (t) => {
@@ -810,11 +917,12 @@ test("HTTP streaming sends SSE chunks and [DONE]", async (t) => {
         ["he", "llo"],
     );
     assert.equal(chunks[3].choices[0].finish_reason, "tool_calls");
-    assert.deepEqual(chunks[4].usage, {
-        prompt_tokens: 7,
-        completion_tokens: 3,
-        total_tokens: 10,
-    });
+    assert.deepEqual(chunks[4].choices, []);
+    assert.deepEqual(chunks[4].usage, EXPECTED_USAGE);
+    assert.equal(
+        chunks.filter((chunk) => chunk.usage !== undefined).length,
+        1,
+    );
     assert.equal(chunks.every((chunk) => (
         chunk.object === "chat.completion.chunk"
     )), true);
@@ -822,26 +930,41 @@ test("HTTP streaming sends SSE chunks and [DONE]", async (t) => {
     assert.equal(signal instanceof globalThis.AbortSignal, true);
 });
 
-test("HTTP streaming omits usage unless requested", async (t) => {
+test("HTTP streaming always sends usage after the finish chunk", async (t) => {
     const models = fakeModels({
         stream: async function* () {
             yield doneEvent();
         },
     });
     const { baseUrl } = await startServer(models, t);
-    const response = await globalThis.fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
+    const streamOptions = [undefined, { include_usage: false }];
+    for (const options of streamOptions) {
+        const body = {
             model: "provider-a/model-a",
             stream: true,
             messages: [{ role: "user", content: "question" }],
-        }),
-    });
-    const frames = await readEventStream(response);
-    const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
-    assert.equal(chunks.length, 2);
-    assert.equal(chunks[1].choices[0].finish_reason, "stop");
+        };
+        if (options !== undefined) body.stream_options = options;
+        const response = await globalThis.fetch(
+            `${baseUrl}/chat/completions`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+            },
+        );
+        const frames = await readEventStream(response);
+        assert.equal(frames.at(-1), "[DONE]");
+        const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
+        assert.equal(chunks.length, 3);
+        assert.equal(chunks[1].choices[0].finish_reason, "stop");
+        assert.deepEqual(chunks[2].choices, []);
+        assert.deepEqual(chunks[2].usage, EXPECTED_USAGE);
+        assert.equal(
+            chunks.filter((chunk) => chunk.usage !== undefined).length,
+            1,
+        );
+    }
 });
 
 test("HTTP streaming ends the stream when the model fails", async (t) => {
@@ -868,8 +991,9 @@ test("HTTP streaming ends the stream when the model fails", async (t) => {
     assert.equal(response.status, 200);
     const frames = await readEventStream(response);
     assert.equal(frames.at(-1), "[DONE]");
-    const last = JSON.parse(frames.at(-2));
-    assert.equal(last.choices[0].finish_reason, "stop");
+    const chunks = frames.slice(0, -1).map((frame) => JSON.parse(frame));
+    assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+    assert.equal(chunks.some((chunk) => chunk.usage !== undefined), false);
     assert.equal(errors.length, 1);
 });
 

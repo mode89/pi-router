@@ -18,6 +18,9 @@ _Reference context — observed facts and standing conventions for this project,
 - Thinking signatures travel in OpenRouter's `reasoning_details` shape (`reasoning.text` with `signature`, `reasoning.encrypted` with `data`), because OpenAI defines no field for them and that shape is the closest de-facto standard.
 - Inbound `reasoning_content` is ignored while `reasoning_details` is replayed, because text without its signature cannot re-enter a thinking block; pi-ai demotes it to plain text anyway.
 - Reasoning round-trip only helps clients that echo `reasoning_details` back; many drop unknown response fields, and for those the router behaves as before.
+- Usage responses omit OpenRouter fields that Pi cannot measure, such as BYOK and media details, because zero would misrepresent an unknown metric as measured.
+- OpenRouter cost fields trust Pi's catalog-derived estimates despite OpenRouter defining cost as actual charges; simple provider-neutral accounting takes priority over billing precision.
+- Completed streams always emit usage regardless of `stream_options.include_usage`, because current OpenRouter clients expect a final usage chunk without opting in.
 - `createChatServer` takes an injected `Models` collection instead of building a default one, so the factory stays synchronous despite `ModelRuntime.create()` being async, and tests inject fakes.
 
 ## Dead Ends
