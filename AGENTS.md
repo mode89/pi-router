@@ -1,6 +1,6 @@
 # pi-router
 
-Stateless Node.js router exposing an OpenAI-compatible `POST /chat/completions` endpoint, buffered or streamed as SSE, backed by `@earendil-works/pi-coding-agent`'s `ModelRuntime`.
+Stateless Node.js router exposing an OpenRouter-compatible `POST /api/v1/chat/completions` endpoint, buffered or streamed as SSE, backed by `@earendil-works/pi-coding-agent`'s `ModelRuntime`.
 
 ## Requirements
 
@@ -19,11 +19,11 @@ Stateless Node.js router exposing an OpenAI-compatible `POST /chat/completions` 
 - `npm install`: install all dependencies
 - `npm test`: run the Node test suite
 - `npm run lint`: run ESLint
-- `npm start`: listen on `127.0.0.1:8742`
+- `npm start`: listen on `127.0.0.1:8742`, serving `POST /api/v1/chat/completions`
 - `./pi-router [--host HOST] [--port PORT]`: install missing runtime dependencies and launch
 
 ## Runtime configuration
 
 `ModelRuntime` reads credentials from `~/.pi/agent/auth.json` and custom models from `~/.pi/agent/models.json`, the same files Pi itself uses.
 
-**Memory — read first.** Read `MEMORY.md` at the start of each session, before your first response — it records facts about this project, its conventions, landmines, dead ends, and decision rationale you can't recover from the code. Skipping it risks repeating solved mistakes.
+**Memory — read first.** Read `MEMORY.md` at the start of each session, before your first response — it records facts about this project, its conventions, landmines, dead ends, and decision rationale the repository alone can't establish. Skipping it risks repeating solved mistakes.

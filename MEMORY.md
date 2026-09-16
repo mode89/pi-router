@@ -3,11 +3,17 @@ _Reference context — observed facts and standing conventions for this project,
 ## Conventions
 
 - Tests (`npm test`) and lint (`npm run lint`) run without asking the user first. Why: both are read-only and fast. How to apply: after any code change, instead of proposing the command and waiting.
+- New router behavior is tested through the HTTP seam only: `createChatServer` with an injected `Models` fake, driven by real requests. Why: tests then state what a client observes. How to apply: instead of adding a unit seam for new behavior.
 - Bulk mechanical edits use `python3` heredoc scripts. Why: `perl` is absent on this NixOS host, and `sed` cannot re-indent multi-line blocks. How to apply: reshaping call sites or nested literals across a file.
 
 ## Gotchas
 
 - Bare model ids like `claude-sonnet-4-5` resolve ambiguously once `ModelRuntime` loads Pi's catalogs, because several providers expose the same id. Qualified `provider/id` is the reliable form.
+- Pi's `resolveCliModel` invents a custom model when a known provider prefix carries an unknown id, so `openrouter/typo` is accepted with a warning; only a name with no provider match gives a not-found error.
+- pi-ai's openai-completions adapter emits `reasoning_details` only for encrypted details whose id matches a tool call, so standalone signed reasoning has no replay path on that route.
+- pi-ai's `transformMessages` downgrades a foreign assistant turn's thinking to plain text and drops its redacted thinking, while text blocks keep their content unchanged.
+- For a foreign assistant turn, `transformMessages` rewrites tool call ids into the target provider's allowed form and rewrites the matching tool results the same way, so replayed call/result pairs stay consistent.
+- `transformMessages` skips an assistant message whose `stopReason` is `error` or `aborted`, so such a turn never reaches the provider.
 - `ModelRuntime.create({ refreshOnCreate: false })` leaves `hasConfiguredAuth()` false for a provider present in `auth.json`, because the availability snapshot never runs. `listCredentials()` still reflects the file.
 
 ## Decisions
@@ -15,15 +21,22 @@ _Reference context — observed facts and standing conventions for this project,
 - Chat inference is stateless and calls pi-ai directly because every request carries its complete conversation; `AgentSession`, RPC subprocesses, and application session caching add machinery without needed state.
 - The router takes `ModelRuntime` from `@earendil-works/pi-coding-agent` rather than `pi-ai` alone, because its `AuthStorage` holds a `proper-lockfile` lock on `~/.pi/agent/auth.json`, so Pi and the router cannot lose each other's OAuth refreshes.
 - The 11 MB `pi-coding-agent` dependency was accepted over adding a ~40-line lock to a router-local credential store, to avoid mirroring Pi's lock convention by hand and drifting from it.
+- pi-router implements a subset of OpenRouter chat completions: text, function tools, reasoning, usage, and streaming. Model listing, images, sampling and length controls, structured output, provider routing, and forced tool choice stay out.
 - Thinking signatures travel in OpenRouter's `reasoning_details` shape (`reasoning.text` with `signature`, `reasoning.encrypted` with `data`), because OpenAI defines no field for them and that shape is the closest de-facto standard.
-- Inbound `reasoning_content` is ignored while `reasoning_details` is replayed, because text without its signature cannot re-enter a thinking block; pi-ai demotes it to plain text anyway.
+- Pi's habit of inventing a custom model for a known provider with an unknown id is kept: matching Pi's model entry beats catching the typo early, though a mistyped id then fails later at the provider.
 - Reasoning round-trip only helps clients that echo `reasoning_details` back; many drop unknown response fields, and for those the router behaves as before.
+- pi-router authenticates no caller and ignores request credentials, staying a trusted local service on Pi's own credentials; a placeholder key is accepted so clients that require one can be configured.
+- A request whose unsupported setting cannot mislead the client is tolerated with a warning, one whose contract pi-router cannot honor is refused: images and constraining `response_format` are refused, a forced tool choice is not.
+- Reasoning is controlled only by OpenRouter's nested `reasoning`; `exclude` and token budgets are ignored, so a client that asks to hide reasoning still receives it.
+- Responses echo the requested model name rather than the model that answered, so clients always match a response to their selection and provider substitution stays invisible.
 - Usage responses omit OpenRouter fields that Pi cannot measure, such as BYOK and media details, because zero would misrepresent an unknown metric as measured.
 - OpenRouter cost fields trust Pi's catalog-derived estimates despite OpenRouter defining cost as actual charges; simple provider-neutral accounting takes priority over billing precision.
 - Completed streams always emit usage regardless of `stream_options.include_usage`, because current OpenRouter clients expect a final usage chunk without opting in.
+- Provider failures use the error type name `provider_error`, which pi-router invents, because OpenRouter's error shape defines only `message` and `code`.
 - `createChatServer` takes an injected `Models` collection instead of building a default one, so the factory stays synchronous despite `ModelRuntime.create()` being async, and tests inject fakes.
 
 ## Dead Ends
 
 - ✗ Router-local `FileCredentialStore` writing `$XDG_CONFIG_HOME/pi-router/auth.json`, abandoned: it serialized refreshes only within one process, forcing manual credential copying to avoid racing Pi.
+- ✗ Injecting OpenRouter `reasoning_details` through pi-ai's `onPayload` hook to repair signature replay on the `openrouter` route, abandoned: it would tie pi-router to OpenRouter's request body format, which it otherwise never touches.
 - ✗ Waiting for `pi-ai` to ship a file-backed credential store, abandoned: as of 0.84.2 it exports only `InMemoryCredentialStore` and expects the app to inject persistence.

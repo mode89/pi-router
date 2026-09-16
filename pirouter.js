@@ -4,14 +4,20 @@ import console from "node:console";
 import { randomUUID } from "node:crypto";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 
-const IGNORED_REQUEST_FIELDS = [
-    "temperature",
-    "stop",
-    "max_tokens",
-    "max_completion_tokens",
-];
+export const CHAT_COMPLETIONS_PATH = "/api/v1/chat/completions";
+
+const RECOGNIZED_REQUEST_FIELDS = new Set([
+    "model",
+    "messages",
+    "tools",
+    "tool_choice",
+    "reasoning",
+    "response_format",
+    "stream",
+    "stream_options",
+]);
 
 const POSITIVE_REASONING_EFFORTS = new Set([
     "minimal",
@@ -23,21 +29,41 @@ const POSITIVE_REASONING_EFFORTS = new Set([
 
 export class RequestError extends Error {}
 
+class ProviderError extends Error {
+    constructor(message, status) {
+        super(message);
+        this.status = status;
+    }
+}
+
 export class UsageError extends Error {}
 
 export function extractText(content) {
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content
-        .filter((part) => (
-            part !== null && typeof part === "object" && part.type === "text"
-        ))
-        .map((part) => part.text)
+        .map(textOfPart)
         .filter((text) => typeof text === "string")
         .join("");
 }
 
-export function splitMessages(messages) {
+function textOfPart(part) {
+    if (part === null || typeof part !== "object") return "";
+    rejectNonTextPart(part);
+    return part.text;
+}
+
+// Only text reaches the model, so any other part, an image above all, is
+// refused: answering as if the model had seen it would mislead the client.
+function rejectNonTextPart(part) {
+    if (part.type !== "text") {
+        throw new RequestError(
+            `unsupported message content part: ${part.type}`,
+        );
+    }
+}
+
+export function splitMessages(messages, model) {
     const systemPrompt = messages
         .filter((message) => (
             message?.role === "system" || message?.role === "developer"
@@ -54,7 +80,7 @@ export function splitMessages(messages) {
                 content: extractText(message.content),
             });
         } else if (message?.role === "assistant") {
-            conversation.push(toAssistantEntry(message));
+            conversation.push(toAssistantEntry(message, model));
         } else if (message?.role === "tool") {
             conversation.push(toToolResultEntry(message, toolNames));
         }
@@ -80,47 +106,93 @@ function indexToolCallNames(messages) {
     return names;
 }
 
-function toAssistantEntry(message) {
+function toAssistantEntry(message, model) {
     const toolCalls = parseToolCalls(message.tool_calls);
     const text = extractText(message.content);
     const textParts = text.length === 0 && toolCalls.length > 0
         ? []
         : [{ type: "text", text }];
+    const reasoning = replayedReasoning(message.reasoning_details, model);
     return {
         role: "assistant",
         // Anthropic rejects a turn whose thinking block does not come first.
         content: [
-            ...parseReasoningDetails(message.reasoning_details),
+            ...reasoning.parts,
             ...textParts,
             ...toolCalls,
         ],
         stopReason: toolCalls.length > 0 ? "toolUse" : "stop",
+        ...replayedAssistantFields(reasoning.origin ?? UNVERIFIED_MODEL),
     };
 }
 
-// A thinking block replays only with the signature its provider issued, so
-// carry OpenRouter's reasoning_details shape both ways; plain reasoning_content
-// is text alone and cannot be replayed.
-export function parseReasoningDetails(details) {
-    if (!Array.isArray(details)) return [];
-    return details
-        .map(toThinkingPart)
-        .filter((part) => part !== null);
+// No real model carries this identity, so pi-ai treats such a turn's reasoning
+// as foreign and downgrades it. A turn whose producing model pi-router cannot
+// verify must not pass as the selected model's own work.
+const UNVERIFIED_MODEL = {
+    api: "pirouter-unverified",
+    provider: "pirouter-unverified",
+    id: "pirouter-unverified",
+};
+
+// A replayed assistant turn carries no usage, but pi-ai's AssistantMessage
+// requires one, so stand in for the original generation. Its model identity is
+// the one that produced the turn, which is what lets pi-ai protect reasoning
+// against a model switch.
+function replayedAssistantFields(model) {
+    return {
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+            },
+        },
+    };
 }
 
-function toThinkingPart(detail) {
+// A thinking block replays only with the signature its provider issued and
+// only to that same model, so pi-router's signature carries both, and the turn
+// keeps the identity of the model that produced it. Plain reasoning_content is
+// text alone and cannot be replayed.
+function replayedReasoning(details, selectedModel) {
+    if (!Array.isArray(details)) return { parts: [], origin: undefined };
+    const provenances = details.map((detail) => (
+        decodeThinkingSignature(detailSignature(detail))
+    ));
+    const origin = provenances
+        .find((provenance) => provenance !== undefined)
+        ?.model;
+    const parts = details
+        .map((detail, index) => toThinkingPart(
+            detail,
+            replayedSignature(provenances[index], origin, selectedModel),
+        ))
+        .filter((part) => part !== null);
+    return { parts, origin };
+}
+
+function toThinkingPart(detail, signature) {
     if (detail?.type === "reasoning.encrypted") {
-        // An empty payload reaches the provider as-is: pi-ai demotes unsigned
-        // thinking to text but replays redacted_thinking unchecked.
-        if (typeof detail.data !== "string" || detail.data.length === 0) {
-            return null;
-        }
+        // Redacted reasoning is nothing but its payload, so without a payload
+        // this model can replay there is no block left to send.
+        if (signature === undefined || signature.length === 0) return null;
         return {
             type: "thinking",
             // Placeholder text only: the adapter replays the encrypted payload
             // from thinkingSignature and discards this.
             thinking: "[Reasoning redacted]",
-            thinkingSignature: detail.data,
+            thinkingSignature: signature,
             redacted: true,
         };
     }
@@ -129,10 +201,85 @@ function toThinkingPart(detail) {
         return null;
     }
     const part = { type: "thinking", thinking: detail.text };
-    if (typeof detail.signature === "string" && detail.signature.length > 0) {
-        part.thinkingSignature = detail.signature;
+    if (signature !== undefined && signature.length > 0) {
+        part.thinkingSignature = signature;
     }
     return part;
+}
+
+// On OpenAI-compatible routes pi-ai stores the name of the response field that
+// carried reasoning where other routes store a signature, and replays it as a
+// field name, so only pi-router's own values may return to it.
+const SIGNATURE_PREFIX = "pirouter-v1.";
+
+// What pi-router's signature carries: the identity of the model that produced
+// a thinking block, and the value pi-ai stored for that block.
+function thinkingProvenance(model, signature) {
+    return { model, signature };
+}
+
+function encodeThinkingSignature(model, signature) {
+    const payload = JSON.stringify({
+        api: model.api,
+        provider: model.provider,
+        id: model.id,
+        signature,
+    });
+    const encoded = Buffer.from(payload, "utf8").toString("base64url");
+    return `${SIGNATURE_PREFIX}${encoded}`;
+}
+
+function decodeThinkingSignature(encoded) {
+    if (typeof encoded !== "string" || !encoded.startsWith(SIGNATURE_PREFIX)) {
+        return undefined;
+    }
+    const payload = parseSignaturePayload(
+        encoded.slice(SIGNATURE_PREFIX.length),
+    );
+    if (payload === undefined) return undefined;
+    const { api, provider, id, signature } = payload;
+    if ([api, provider, id, signature].some((field) => (
+        typeof field !== "string"
+    ))) {
+        return undefined;
+    }
+    return thinkingProvenance({ api, provider, id }, signature);
+}
+
+function parseSignaturePayload(encoded) {
+    try {
+        const payload = JSON.parse(
+            Buffer.from(encoded, "base64url").toString("utf8"),
+        );
+        return payload !== null && typeof payload === "object"
+            ? payload
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function detailSignature(detail) {
+    if (detail?.type === "reasoning.encrypted") return detail.data;
+    if (detail?.type === "reasoning.text") return detail.signature;
+    return undefined;
+}
+
+// One replayed turn may mix entries from several models. Only the entries of
+// the turn's origin may keep a signature, and only when that origin is the
+// model now selected; every other entry travels as reasoning text alone.
+function replayedSignature(provenance, origin, selectedModel) {
+    if (provenance === undefined) return undefined;
+    const belongsToTurn = sameModel(provenance.model, origin);
+    return belongsToTurn && sameModel(provenance.model, selectedModel)
+        ? provenance.signature
+        : undefined;
+}
+
+function sameModel(produced, selected) {
+    return produced.api === selected.api
+        && produced.provider === selected.provider
+        && produced.id === selected.id;
 }
 
 function toToolResultEntry(message, toolNames) {
@@ -194,43 +341,53 @@ function parseToolArguments(raw, name) {
     return parsed;
 }
 
-export function normalizeReasoningEffort(effort, logger = console) {
-    if (effort === undefined || effort === null || effort === "none") {
+// OpenRouter's reasoning object; Pi's thinking levels are its effort values.
+export function parseReasoningOption(reasoning, logger = console) {
+    if (reasoning === undefined || reasoning === null) return undefined;
+    if (typeof reasoning !== "object" || Array.isArray(reasoning)) {
+        const formatted = JSON.stringify(reasoning);
+        logger.warn?.(`ignoring unsupported reasoning: ${formatted}`);
         return undefined;
     }
-    if (POSITIVE_REASONING_EFFORTS.has(effort)) return effort;
-    const formattedEffort = JSON.stringify(effort);
-    logger.warn?.(`unknown reasoning_effort: ${formattedEffort} (ignored)`);
+    for (const member of Object.keys(reasoning)) {
+        if (member !== "effort" && member !== "enabled") {
+            logger.warn?.(`ignoring unsupported reasoning member: ${member}`);
+        }
+    }
+    // An effort pi-router knows decides alone; `enabled` decides only when the
+    // request names no such effort.
+    const effort = knownEffort(reasoning.effort, logger);
+    if (effort === "none") return undefined;
+    if (effort !== undefined) return effort;
+    if (reasoning.enabled === true) return "medium";
     return undefined;
 }
 
-export function resolveModel(models, requestedModel) {
+function knownEffort(effort, logger) {
+    if (effort === undefined || effort === null) return undefined;
+    if (effort === "none" || POSITIVE_REASONING_EFFORTS.has(effort)) {
+        return effort;
+    }
+    const formatted = JSON.stringify(effort);
+    logger.warn?.(`ignoring unknown reasoning effort: ${formatted}`);
+    return undefined;
+}
+
+// Pi's own resolver, so a model name reaches the router as it reaches Pi.
+export function resolveModel(models, requestedModel, logger = console) {
     if (typeof requestedModel !== "string" || requestedModel.length === 0) {
         throw new RequestError("model must be a non-empty string");
     }
-
-    const slash = requestedModel.indexOf("/");
-    if (slash !== -1) {
-        const provider = requestedModel.slice(0, slash);
-        const modelId = requestedModel.slice(slash + 1);
-        if (!provider || !modelId) {
-            throw new RequestError(`unknown model: ${requestedModel}`);
-        }
-        const model = models.getModel(provider, modelId);
-        if (!model) throw new RequestError(`unknown model: ${requestedModel}`);
-        return model;
-    }
-
-    const matches = models
-        .getModels()
-        .filter((model) => model.id === requestedModel);
-    if (matches.length === 0) {
-        throw new RequestError(`unknown model: ${requestedModel}`);
-    }
-    if (matches.length > 1) {
-        throw new RequestError(`ambiguous model: ${requestedModel}`);
-    }
-    return matches[0];
+    // resolveCliModel also reports a thinking level parsed from a
+    // "model:level" name; it is left unread, since the reasoning object is the
+    // only reasoning control of this API.
+    const { model, warning, error } = resolveCliModel({
+        cliModel: requestedModel,
+        modelRuntime: models,
+    });
+    if (warning) logger.warn?.(warning);
+    if (!model) throw new RequestError(error ?? `unknown model: ${requestedModel}`);
+    return model;
 }
 
 export function parseRequest(body, models, logger = console) {
@@ -240,14 +397,15 @@ export function parseRequest(body, models, logger = console) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
         throw new RequestError("messages must be a non-empty array");
     }
-    for (const field of IGNORED_REQUEST_FIELDS) {
-        if (Object.hasOwn(body, field)) {
+    rejectResponseFormat(body.response_format);
+    for (const field of Object.keys(body)) {
+        if (!RECOGNIZED_REQUEST_FIELDS.has(field)) {
             logger.warn?.(`ignoring unsupported field: ${field}`);
         }
     }
 
-    const model = resolveModel(models, body.model);
-    const { systemPrompt, conversation } = splitMessages(body.messages);
+    const model = resolveModel(models, body.model, logger);
+    const { systemPrompt, conversation } = splitMessages(body.messages, model);
     if (conversation.length === 0) {
         throw new RequestError("no user/assistant/tool messages");
     }
@@ -262,9 +420,18 @@ export function parseRequest(body, models, logger = console) {
         systemPrompt,
         conversation,
         tools: parseTools(body.tools, body.tool_choice, logger),
-        reasoning: normalizeReasoningEffort(body.reasoning_effort, logger),
+        reasoning: parseReasoningOption(body.reasoning, logger),
         stream: body.stream === true,
     };
+}
+
+// Nothing here constrains what the model writes, so a demanded format could
+// only be promised, not kept.
+function rejectResponseFormat(responseFormat) {
+    if (responseFormat === undefined || responseFormat === null) return;
+    const type = responseFormat.type;
+    if (type === undefined || type === "text") return;
+    throw new RequestError(`unsupported response_format: ${type}`);
 }
 
 export function parseTools(tools, toolChoice, logger = console) {
@@ -311,11 +478,9 @@ function toToolDefinition(tool) {
 }
 
 export function buildContext(chatRequest, timestamp = Date.now()) {
-    const { systemPrompt, tools, model } = chatRequest;
+    const { systemPrompt, tools } = chatRequest;
     const messages = chatRequest.conversation.map((message) => (
-        message.role === "assistant"
-            ? { ...message, ...replayedAssistantFields(model), timestamp }
-            : { ...message, timestamp }
+        { ...message, timestamp }
     ));
     const context = { messages };
     if (systemPrompt) context.systemPrompt = systemPrompt;
@@ -323,38 +488,15 @@ export function buildContext(chatRequest, timestamp = Date.now()) {
     return context;
 }
 
-// Replayed assistant turns carry no provenance or usage, but pi-ai's
-// AssistantMessage requires both, so stand in for the original generation.
-function replayedAssistantFields(model) {
-    return {
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 0,
-            cost: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                total: 0,
-            },
-        },
-    };
-}
-
 export function buildCompletion(
-    requestedModel,
+    chatRequest,
     assistant,
     {
         id = randomUUID().replaceAll("-", ""),
         created = Math.floor(Date.now() / 1000),
     } = {},
 ) {
+    const { requestedModel, model } = chatRequest;
     const text = joinParts(assistant.content, "text", "text");
     const reasoning = joinParts(
         assistant.content,
@@ -368,8 +510,8 @@ export function buildCompletion(
         role: "assistant",
         content: hasToolCalls && text.length === 0 ? null : text,
     };
-    const reasoningDetails = toReasoningDetails(assistant.content);
-    if (reasoning.length > 0) message.reasoning_content = reasoning;
+    const reasoningDetails = toReasoningDetails(assistant.content, model);
+    if (reasoning.length > 0) message.reasoning = reasoning;
     if (reasoningDetails.length > 0) {
         message.reasoning_details = reasoningDetails;
     }
@@ -382,28 +524,55 @@ export function buildCompletion(
         choices: [{
             index: 0,
             message,
-            finish_reason: finishReason(assistant.stopReason, hasToolCalls),
+            finish_reason: finishReason(assistant, hasToolCalls),
         }],
         usage: toUsage(assistant.usage),
     };
 }
 
-function toReasoningDetails(content) {
+function toReasoningDetails(content, model) {
     return content
         .filter((part) => part?.type === "thinking")
-        .map(toReasoningDetail);
+        .map((part, index) => toReasoningDetail(part, index, model));
 }
 
-function toReasoningDetail(part) {
+function toReasoningDetail(part, index, model) {
+    const attribution = {
+        format: reasoningFormat(model),
+        id: null,
+        index,
+    };
     if (part.redacted === true) {
         return {
             type: "reasoning.encrypted",
-            data: part.thinkingSignature ?? "",
+            data: encodeThinkingSignature(model, part.thinkingSignature ?? ""),
+            ...attribution,
         };
     }
     const detail = { type: "reasoning.text", text: part.thinking ?? "" };
-    if (part.thinkingSignature) detail.signature = part.thinkingSignature;
-    return detail;
+    if (part.thinkingSignature) {
+        detail.signature = encodeThinkingSignature(
+            model,
+            part.thinkingSignature,
+        );
+    }
+    return { ...detail, ...attribution };
+}
+
+// OpenRouter names the provider family that produced the reasoning.
+function reasoningFormat(model) {
+    if (model.api === "anthropic-messages"
+        || model.api === "bedrock-converse-stream") {
+        return "anthropic-claude-v1";
+    }
+    if (model.api === "google-generative-ai" || model.api === "google-vertex") {
+        return "google-gemini-v1";
+    }
+    // Every pi-ai api name ending in "responses" is a route of OpenAI's
+    // Responses API, whatever provider serves it.
+    return model.api?.endsWith("responses")
+        ? "openai-responses-v1"
+        : "unknown";
 }
 
 function toolCallParts(content) {
@@ -466,12 +635,12 @@ export function chunkEnvelope(
 }
 
 // One event maps to zero, one, or two chunks.
-export function buildChunks(envelope, event) {
+export function buildChunks(envelope, event, model) {
     if (event.type === "text_delta") {
         return [toChunk(envelope, { content: event.delta })];
     }
     if (event.type === "thinking_delta") {
-        return [toChunk(envelope, { reasoning_content: event.delta })];
+        return [toChunk(envelope, { reasoning: event.delta })];
     }
     // The signature only exists once the block closes, and a redacted block
     // emits no delta at all, so both travel in the thinking_end chunk.
@@ -479,7 +648,9 @@ export function buildChunks(envelope, event) {
         const part = event.partial?.content?.[event.contentIndex];
         if (part?.type !== "thinking") return [];
         return [toChunk(envelope, {
-            reasoning_details: [toReasoningDetail(part)],
+            reasoning_details: [
+                toReasoningDetail(part, reasoningIndex(event), model),
+            ],
         })];
     }
     // Tool calls go out whole at toolcall_end rather than as argument
@@ -489,6 +660,8 @@ export function buildChunks(envelope, event) {
         return [toChunk(envelope, { tool_calls: [streamedToolCall(event)] })];
     }
     if (event.type !== "done" && event.type !== "error") return [];
+    // A failure throws before chunks are built, so an error event reaching
+    // here is blocked content, reported as a finished turn.
     const message = event.type === "done" ? event.message : event.error;
     const chunks = [finalChunk(envelope, message)];
     if (message.usage !== undefined) {
@@ -510,20 +683,28 @@ function toolCallIndex(event) {
     return toolCallParts(preceding).length;
 }
 
+// OpenRouter numbers reasoning entries among themselves in the same way.
+function reasoningIndex(event) {
+    return event.partial.content
+        .slice(0, event.contentIndex)
+        .filter((part) => part?.type === "thinking")
+        .length;
+}
+
 function finalChunk(envelope, message) {
     const hasToolCalls = toolCallParts(message.content).length > 0;
     return toChunk(
         envelope,
         {},
-        finishReason(message.stopReason, hasToolCalls),
+        finishReason(message, hasToolCalls),
     );
 }
 
-// OpenAI reports streamed usage in a trailing chunk that carries no choice.
+// OpenRouter reports streamed usage in a trailing chunk whose single choice
+// carries an empty delta.
 function usageChunk(envelope, message) {
     return {
-        ...envelope,
-        choices: [],
+        ...toChunk(envelope, {}),
         usage: toUsage(message.usage),
     };
 }
@@ -535,11 +716,56 @@ function toChunk(envelope, delta, reason = null) {
     };
 }
 
-function finishReason(stopReason, hasToolCalls) {
+function finishReason(message, hasToolCalls) {
+    if (isContentFiltered(message)) return "content_filter";
     // hasToolCalls also decides it, for providers that emit tool calls
     // without setting stopReason=toolUse.
-    if (stopReason === "toolUse" || hasToolCalls) return "tool_calls";
-    return stopReason === "length" ? "length" : "stop";
+    if (message.stopReason === "toolUse" || hasToolCalls) return "tool_calls";
+    return message.stopReason === "length" ? "length" : "stop";
+}
+
+// Every provider reports blocked content as a failed turn, and keeps its own
+// word for the block in rawStopReason.
+const BLOCKED_STOP_REASONS = new Set([
+    "content_filter",
+    "sensitive",
+    "refusal",
+    "safety",
+    "image_safety",
+    "blocklist",
+    "prohibited_content",
+    "image_prohibited_content",
+    "spii",
+]);
+
+function isContentFiltered(message) {
+    return message.stopReason === "error"
+        && BLOCKED_STOP_REASONS.has(
+            String(message.rawStopReason ?? "").toLowerCase(),
+        );
+}
+
+// A turn Pi reports as failed is a failure of the request, not an answer.
+function providerFailure(message) {
+    const failed = message.stopReason === "error"
+        || message.stopReason === "aborted";
+    if (!failed || isContentFiltered(message)) return undefined;
+    const detail = message.errorMessage
+        || `model stopped: ${message.stopReason}`;
+    return new ProviderError(detail, providerStatus(detail));
+}
+
+function toProviderError(error) {
+    if (error instanceof ProviderError) return error;
+    const text = error instanceof Error ? error.message : String(error);
+    return new ProviderError(text, providerStatus(text));
+}
+
+// Pi composes a provider error text that begins with the HTTP status it got.
+function providerStatus(text) {
+    const match = /^\s*(\d{3})\b/.exec(text);
+    const status = match ? Number(match[1]) : 0;
+    return status >= 400 && status <= 599 ? status : 500;
 }
 
 function joinParts(content, type, field, separator = "") {
@@ -553,7 +779,8 @@ function joinParts(content, type, field, separator = "") {
 
 export function createChatServer({ models, logger = console }) {
     return http.createServer(async (request, response) => {
-        if (request.method !== "POST" || request.url !== "/chat/completions") {
+        if (request.method !== "POST"
+            || request.url !== CHAT_COMPLETIONS_PATH) {
             sendError(response, 404, "not found", "invalid_request_error");
             return;
         }
@@ -570,11 +797,9 @@ export function createChatServer({ models, logger = console }) {
                 buildContext(chatRequest),
                 completionOptions(chatRequest),
             );
-            warnOnFailedStop(assistant, logger);
-            sendJson(response, 200, buildCompletion(
-                chatRequest.requestedModel,
-                assistant,
-            ));
+            const failure = providerFailure(assistant);
+            if (failure) throw failure;
+            sendJson(response, 200, buildCompletion(chatRequest, assistant));
         } catch (error) {
             if (error instanceof RequestError) {
                 sendError(
@@ -585,10 +810,13 @@ export function createChatServer({ models, logger = console }) {
                 );
             } else {
                 logger.error?.("request failed", error);
-                const message = error instanceof Error
-                    ? error.message
-                    : String(error);
-                sendError(response, 500, message, "server_error");
+                const failure = toProviderError(error);
+                sendError(
+                    response,
+                    failure.status,
+                    failure.message,
+                    "provider_error",
+                );
             }
         }
     });
@@ -605,27 +833,73 @@ async function streamCompletion(models, chatRequest, response, logger) {
     );
 
     const envelope = chunkEnvelope(chatRequest.requestedModel);
-    beginEventStream(response);
-    // The opening role chunk is ours, not a mapped `start` event: adapters may
-    // skip `start`, and OpenAI clients expect the role before any delta.
-    sendChunk(response, toChunk(envelope, { role: "assistant", content: "" }));
+    const sink = chunkSink(response, envelope);
     try {
         for await (const event of events) {
-            if (event.type === "error") {
-                // pi-ai reports a failed turn as its final AssistantMessage.
-                warnOnFailedStop(event.error, logger);
-            }
-            const chunks = buildChunks(envelope, event);
-            for (const chunk of chunks) sendChunk(response, chunk);
+            const failure = streamedFailure(event);
+            if (failure) throw failure;
+            const chunks = buildChunks(envelope, event, chatRequest.model);
+            for (const chunk of chunks) sink.write(chunk);
         }
+        sink.open();
     } catch (error) {
-        // The status line is already sent, so no error status can follow.
-        // OpenAI defines no failing finish_reason, so the client sees "stop"
-        // and a short answer; the real cause stays in the server log.
         logger.error?.("stream failed", error);
-        sendChunk(response, toChunk(envelope, {}, "stop"));
+        const failure = toProviderError(error);
+        if (!sink.isOpen()) {
+            sendError(
+                response,
+                failure.status,
+                failure.message,
+                "provider_error",
+            );
+            return;
+        }
+        sink.write(errorChunk(failure));
     }
     endEventStream(response);
+}
+
+// The response head is written once, on the first chunk, so a failure before
+// any output can still be answered with an HTTP status.
+function chunkSink(response, envelope) {
+    let opened = false;
+    return {
+        open() {
+            if (opened) return;
+            opened = true;
+            beginEventStream(response);
+            // The opening role chunk is ours, not a mapped `start` event:
+            // adapters may skip `start`, and OpenAI clients expect the role
+            // before any delta.
+            sendChunk(
+                response,
+                toChunk(envelope, { role: "assistant", content: "" }),
+            );
+        },
+        write(chunk) {
+            this.open();
+            sendChunk(response, chunk);
+        },
+        isOpen() {
+            return opened;
+        },
+    };
+}
+
+// pi-ai reports a failed turn as an error event carrying the partial
+// AssistantMessage; a done event always ends a turn that produced an answer.
+function streamedFailure(event) {
+    return event.type === "error" ? providerFailure(event.error) : undefined;
+}
+
+function errorChunk(failure) {
+    return {
+        error: {
+            message: failure.message,
+            type: "provider_error",
+            code: failure.status,
+        },
+    };
 }
 
 function completionOptions(chatRequest) {
@@ -667,17 +941,6 @@ function parseJson(raw) {
     } catch (error) {
         throw new RequestError(`invalid JSON: ${error.message}`);
     }
-}
-
-function warnOnFailedStop(assistant, logger) {
-    if (
-        assistant.stopReason !== "error"
-        && assistant.stopReason !== "aborted"
-    ) {
-        return;
-    }
-    const detail = assistant.errorMessage || "(no detail)";
-    logger.warn?.(`assistant stopReason=${assistant.stopReason}: ${detail}`);
 }
 
 function sendJson(response, status, payload) {
